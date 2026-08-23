@@ -77,16 +77,16 @@ class MatmulBackward : public Node<T> {
 
 public:
     MatmulBackward(const Tensor<T>& A, const Tensor<T>& B)
-        : Node<T>(),
+        : Node<T>(A, B),
           M_(A.shape()[0]), K_(A.shape()[1]), N_(B.shape()[1]),
           A_data_(to_contiguous_2d(A)),
           B_data_(to_contiguous_2d(B)),
           A_shape_(A.shape()),
           B_shape_(B.shape())
     {
-        this->next_edges.reserve(2);
-        this->next_edges.emplace_back(Node<T>::get_next_edge(A));
-        this->next_edges.emplace_back(Node<T>::get_next_edge(B));
+        // Node<T>(A, B) sets saved_tensors[0/1] and next_edges[0/1].
+        // A_data_ / B_data_ are contiguous copies needed for the actual
+        // backward computation (inputs may be non-contiguous after transpose).
     }
 
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {

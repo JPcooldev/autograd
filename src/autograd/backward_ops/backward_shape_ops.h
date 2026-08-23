@@ -16,12 +16,8 @@ class TransposeBackward : public Node<T> {
     int64_t dim1_;
 public:
     TransposeBackward(const Tensor<T>& x, const int64_t dim0, const int64_t dim1)
-    // we do not want to copy the input tensor, therefore Node<T>(), not Node<T>(x)
-        : Node<T>(), dim0_(dim0), dim1_(dim1) 
-    {
-        this->next_edges.reserve(1);
-        this->next_edges.emplace_back(Node<T>::get_next_edge(x));
-    }
+        : Node<T>(x), dim0_(dim0), dim1_(dim1)
+    {}
 
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override 
     {
@@ -42,11 +38,8 @@ class ReshapeBackward : public Node<T> {
     std::vector<int64_t> original_shape_;
 public:
     ReshapeBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
-        : Node<T>(), original_shape_(std::move(original_shape))
-    {
-        this->next_edges.reserve(1);
-        this->next_edges.emplace_back(Node<T>::get_next_edge(x));
-    }
+        : Node<T>(x), original_shape_(std::move(original_shape))
+    {}
 
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
     {
@@ -125,11 +118,8 @@ class FlattenBackward : public Node<T> {
     std::vector<int64_t> original_shape_;
 public:
     FlattenBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
-        : Node<T>(), original_shape_(std::move(original_shape))
-    {
-        this->next_edges.reserve(1);
-        this->next_edges.emplace_back(Node<T>::get_next_edge(x));
-    }
+        : Node<T>(x), original_shape_(std::move(original_shape))
+    {}
 
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
     {
@@ -144,11 +134,8 @@ class SqueezeBackward : public Node<T> {
     std::vector<int64_t> original_shape_;
 public:
     SqueezeBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
-        : Node<T>(), original_shape_(std::move(original_shape))
-    {
-        this->next_edges.reserve(1);
-        this->next_edges.emplace_back(Node<T>::get_next_edge(x));
-    }
+        : Node<T>(x), original_shape_(std::move(original_shape))
+    {}
 
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
     {
@@ -163,11 +150,8 @@ class UnsqueezeBackward : public Node<T> {
     std::vector<int64_t> original_shape_;
 public:
     UnsqueezeBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
-        : Node<T>(), original_shape_(std::move(original_shape))
-    {
-        this->next_edges.reserve(1);
-        this->next_edges.emplace_back(Node<T>::get_next_edge(x));
-    }
+        : Node<T>(x), original_shape_(std::move(original_shape))
+    {}
 
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
     {
@@ -183,11 +167,8 @@ class BroadcastToBackward : public Node<T> {
     std::vector<int64_t> original_shape_;
 public:
     BroadcastToBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
-        : Node<T>(), original_shape_(std::move(original_shape))
-    {
-        this->next_edges.reserve(1);
-        this->next_edges.emplace_back(Node<T>::get_next_edge(x));
-    }
+        : Node<T>(x), original_shape_(std::move(original_shape))
+    {}
 
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
     {

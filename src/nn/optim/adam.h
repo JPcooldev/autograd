@@ -1,0 +1,115 @@
+#pragma once
+
+#include <cmath>
+#include <unordered_map>
+#include <vector>
+
+#include "optimizer.h"
+
+namespace nn {
+namespace optim {
+
+template <typename T>
+struct AdamState {
+    std::vector<T> m;
+    std::vector<T> v;
+    int64_t step = 0;
+};
+
+template <typename T>
+class Adam : public Optimizer<T> {
+    double beta1_;
+    double beta2_;
+    double eps_;
+    std::unordered_map<tensor::Tensor<T>*, AdamState<T>> state_;
+
+public:
+    Adam(
+        std::vector<tensor::Tensor<T>*> parameters,
+        double learning_rate,
+        double beta1 = 0.9,
+        double beta2 = 0.999,
+        double eps = 1e-8,
+        double weight_decay = 0.0
+    ) :
+        Optimizer<T>(parameters, learning_rate, weight_decay),
+        beta1_(beta1),
+        beta2_(beta2),
+        eps_(eps)
+    {
+        // allocate state for each parameter
+        for (auto* param : this->parameters_) {
+            const size_t n = param->data().size();
+            state_[param] = { std::vector<T>(n, T{0}), std::vector<T>(n, T{0}) };
+        }
+    }
+
+    ~Adam() = default;
+
+    void step() override
+    {
+        const double learning_rate = this->learning_rate_;
+        const double weight_decay = this->weight_decay_;
+        const double beta1 = beta1_;
+        const double beta2 = beta2_;
+        const double eps = eps_;
+        const double one_minus_beta1 = 1.0 - beta1;
+        const double one_minus_beta2 = 1.0 - beta2;
+
+        for (auto* param : this->parameters_) {
+            if (!param->requires_grad())
+                continue;
+
+            const tensor::Tensor<T>* grad_tensor = param->grad();
+            if (!grad_tensor)
+                continue;
+
+            auto& state = state_[param];
+            auto& data  = param->data();
+            const auto& grad = grad_tensor->data();
+            const size_t n   = data.size();
+            ++state.step;
+            // bc_k = 1 - beta_k^t
+            const double one_minus_beta1_pow_step = 1.0 - std::pow(beta1, static_cast<double>(state.step));
+            const double one_minus_beta2_pow_step = 1.0 - std::pow(beta2, static_cast<double>(state.step));
+
+            if (weight_decay > 0.0) {
+                for (size_t i = 0; i < n; ++i) {
+                    // g_eff = g_t + wd * theta_{t-1}
+                    const double g = static_cast<double>(grad[i]) + weight_decay * static_cast<double>(data[i]);
+
+                    // m_t = beta1 * m_{t-1} + (1 - beta1) * g_eff
+                    state.m[i] = static_cast<T>(beta1 * static_cast<double>(state.m[i]) + one_minus_beta1 * g);
+                    // v_t = beta2 * v_{t-1} + (1 - beta2) * g_eff^2
+                    state.v[i] = static_cast<T>(beta2 * static_cast<double>(state.v[i]) + one_minus_beta2 * g * g);
+
+                    // m_hat = m_t / (1 - beta1^t),  v_hat = v_t / (1 - beta2^t)
+                    const double m_hat = static_cast<double>(state.m[i]) / one_minus_beta1_pow_step;
+                    const double v_hat = static_cast<double>(state.v[i]) / one_minus_beta2_pow_step;
+                    // theta_t = theta_{t-1} - lr * m_hat / (sqrt(v_hat) + eps)
+                    data[i] -= static_cast<T>(learning_rate * m_hat / (std::sqrt(v_hat) + eps));
+                }
+            } else {
+                for (size_t i = 0; i < n; ++i) {
+                    const double g = static_cast<double>(grad[i]);
+
+                    // m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
+                    state.m[i] = static_cast<T>(beta1 * static_cast<double>(state.m[i]) + one_minus_beta1 * g);
+                    // v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2
+                    state.v[i] = static_cast<T>(beta2 * static_cast<double>(state.v[i]) + one_minus_beta2 * g * g);
+
+                    // m_hat = m_t / (1 - beta1^t),  v_hat = v_t / (1 - beta2^t)
+                    const double m_hat = static_cast<double>(state.m[i]) / one_minus_beta1_pow_step;
+                    const double v_hat = static_cast<double>(state.v[i]) / one_minus_beta2_pow_step;
+                    // theta_t = theta_{t-1} - learning_rate * m_hat / (sqrt(v_hat) + eps)
+                    data[i] -= static_cast<T>(
+                        learning_rate * (m_hat / (std::sqrt(v_hat) + eps))
+                    );
+                }
+            }
+        }
+    }
+};
+
+} // namespace optim
+} // namespace nn

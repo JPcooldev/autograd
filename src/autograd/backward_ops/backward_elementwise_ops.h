@@ -189,6 +189,47 @@ public:
 };
 
 template <typename T>
+class SinhBackward : public Node<T> {
+public:
+    explicit SinhBackward(const Tensor<T>& x) : Node<T>(x) {}
+
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
+        const Tensor<T>& x = this->saved_tensors[0];
+        // d/dx sinh(x) = cosh(x)
+        const Tensor<T> grad_x = x.cosh().multiply(propagated_grad);
+        return {grad_x};
+    }
+};
+
+template <typename T>
+class CoshBackward : public Node<T> {
+public:
+    explicit CoshBackward(const Tensor<T>& x) : Node<T>(x) {}
+
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
+        const Tensor<T>& x = this->saved_tensors[0];
+        // d/dx cosh(x) = sinh(x)
+        const Tensor<T> grad_x = x.sinh().multiply(propagated_grad);
+        return {grad_x};
+    }
+};
+
+template <typename T>
+class TanhBackward : public Node<T> {
+public:
+    explicit TanhBackward(const Tensor<T>& x) : Node<T>(x) {}
+
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
+        const Tensor<T>& x = this->saved_tensors[0];
+        // d/dx tanh(x) = 1 - tanh(x)^2
+        const Tensor<T> ones(x.shape(), static_cast<T>(1), false);
+        const Tensor<T> tanh_x = x.tanh();
+        const Tensor<T> local_grad = ones.subtract(tanh_x.power(static_cast<T>(2)));
+        return {local_grad.multiply(propagated_grad)};
+    }
+};
+
+template <typename T>
 class SigmoidBackward : public Node<T> {
 public:
     explicit SigmoidBackward(const Tensor<T>& x) : Node<T>(x) {}
@@ -216,6 +257,52 @@ public:
         const Tensor<T> mask_tensor = Tensor<T>::from_operation_result(
             x.shape(), std::move(mask), false, nullptr);
         return {mask_tensor.multiply(propagated_grad)};
+    }
+};
+
+template <typename T>
+class SiLUBackward : public Node<T> {
+public:
+    explicit SiLUBackward(const Tensor<T>& x) : Node<T>(x) {}
+
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
+        const Tensor<T>& x = this->saved_tensors[0];
+        // d/dx SiLU(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        const Tensor<T> ones(x.shape(), static_cast<T>(1), false);
+        const Tensor<T> sigmoid_x = ones.divide(ones.add(x.neg().exp()));
+        const Tensor<T> local_grad = sigmoid_x.multiply(ones.add(x.multiply(ones.subtract(sigmoid_x))));
+        return {local_grad.multiply(propagated_grad)};
+    }
+};
+
+template <typename T>
+class GELUBackward : public Node<T> {
+public:
+    explicit GELUBackward(const Tensor<T>& x) : Node<T>(x) {}
+
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
+        const Tensor<T>& x = this->saved_tensors[0];
+        // GELU'(x) = 0.5*(1 + tanh(u)) + 0.5*x * sech^2(u) * k*(1 + 3*c*x^2)
+        // where u = k*(x + c*x^3), k = sqrt(2/pi), c = 0.044715
+        const T k         = static_cast<T>(std::sqrt(2.0 / M_PI));  // sqrt(2/pi)
+        constexpr T c     = static_cast<T>(0.044715);
+        constexpr T half  = static_cast<T>(0.5);
+        constexpr T one   = static_cast<T>(1);
+        constexpr T three = static_cast<T>(3);
+
+        const size_t n = static_cast<size_t>(x.numel());
+        std::vector<T> grad_storage(n);
+        for (size_t i = 0; i < n; ++i) {
+            const T xi     = x.data()[i];
+            const T u      = k * (xi + c * static_cast<T>(std::pow(xi, 3)));
+            const T tanh_u = static_cast<T>(std::tanh(u));
+            const T sech2  = one - tanh_u * tanh_u;
+            const T du_dx  = k * (one + three * c * xi * xi);
+            grad_storage[i] = half * (one + tanh_u) + half * xi * sech2 * du_dx;
+        }
+        const Tensor<T> local_grad = Tensor<T>::from_operation_result(
+            x.shape(), std::move(grad_storage), false, nullptr);
+        return {local_grad.multiply(propagated_grad)};
     }
 };
 

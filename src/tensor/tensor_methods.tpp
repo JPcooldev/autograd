@@ -2,7 +2,6 @@
 #include "../ops/elementwise_ops.h"
 #include "../ops/reduction_ops.h"
 #include "../ops/linalg_ops.h"
-#include "../autograd/accumulate_grad.h"
 #include "../autograd/engine.h"
 
 namespace tensor {
@@ -135,6 +134,21 @@ Tensor<T> Tensor<T>::tan() const {
 }
 
 template <typename T>
+Tensor<T> Tensor<T>::sinh() const {
+    return ops::sinh<T>(*this);
+}
+
+template <typename T>
+Tensor<T> Tensor<T>::cosh() const {
+    return ops::cosh<T>(*this);
+}
+
+template <typename T>
+Tensor<T> Tensor<T>::tanh() const {
+    return ops::tanh<T>(*this);
+}
+
+template <typename T>
 Tensor<T> Tensor<T>::sigmoid() const {
     return ops::sigmoid<T>(*this);
 }
@@ -142,6 +156,16 @@ Tensor<T> Tensor<T>::sigmoid() const {
 template <typename T>
 Tensor<T> Tensor<T>::relu() const {
     return ops::relu<T>(*this);
+}
+
+template <typename T>
+Tensor<T> Tensor<T>::silu() const {
+    return ops::silu<T>(*this);
+}
+
+template <typename T>
+Tensor<T> Tensor<T>::gelu() const {
+    return ops::gelu<T>(*this);
 }
 
 // ----- reduction operations -----
@@ -176,6 +200,11 @@ Tensor<T> Tensor<T>::min() const {
     return ops::min<T>(*this);
 }
 
+template <typename T>
+Tensor<T> Tensor<T>::softmax(int64_t dim) const {
+    return ops::softmax<T>(*this, dim);
+}
+
 // ----- linalg operations -----
 
 template <typename T>
@@ -190,32 +219,34 @@ Tensor<T> Tensor<T>::matmul(const Tensor<T>& other) const {
 
 // ----- grad / backward -----
 
-// Lazily create (and cache) the AccumulateGrad node for this leaf tensor.
-// Subsequent calls return the same shared node, so all ops that take this
-// tensor as input wire to the same AccumulateGrad instance.
-template <typename T>
-const std::shared_ptr<autograd::Node<T>>& Tensor<T>::ensure_accumulate_grad_fn() const {
-    if (!accumulate_grad_fn_)
-        accumulate_grad_fn_ = std::make_shared<autograd::AccumulateGrad<T>>();
-    return accumulate_grad_fn_;
-}
-
-// Return the accumulated gradient for this leaf tensor, or nullptr if
-// backward() has not been called yet or this tensor doesn't require grad.
+// Return the accumulated gradient tensor, or nullptr if backward has not
+// been called yet or this tensor does not require grad.
 template <typename T>
 const Tensor<T>* Tensor<T>::grad() const {
-    if (!requires_grad_ || !is_leaf() || !accumulate_grad_fn_)
-        return nullptr;
-    return static_cast<autograd::AccumulateGrad<T>*>(accumulate_grad_fn_.get())
-               ->accumulated_grad();
+    if (!grad_storage_ || !grad_storage_->tensor) return nullptr;
+    return grad_storage_->tensor.get();
 }
 
-// Reset the accumulated gradient to nullptr.
-// Call before running a second backward pass to avoid accumulation across passes.
+// Accumulate `g` into this leaf tensor's GradStorage.
+// Called by the engine for each leaf input encountered during backward.
+template <typename T>
+void Tensor<T>::accumulate_grad(const Tensor<T>& g) {
+    if (!grad_storage_) return;
+    if (!grad_storage_->tensor) {
+        grad_storage_->tensor = std::make_shared<Tensor<T>>(g.shape(), g.data(), false);
+    } else {
+        auto& dst = grad_storage_->tensor->data();
+        const auto& src = g.data();
+        for (size_t i = 0; i < dst.size(); ++i)
+            dst[i] += src[i];
+    }
+}
+
+// Reset the gradient to nullptr while keeping grad_storage_ alive, so aliases
+// created in the next forward pass continue to share the same GradStorage.
 template <typename T>
 void Tensor<T>::zero_grad() const {
-    if (accumulate_grad_fn_)
-        static_cast<autograd::AccumulateGrad<T>*>(accumulate_grad_fn_.get())->zero();
+    if (grad_storage_) grad_storage_->tensor = nullptr;
 }
 
 // Kick off the backward pass from this tensor.

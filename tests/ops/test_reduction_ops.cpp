@@ -50,9 +50,9 @@ TEST_CASE("sum() tracks grad and creates SumBackward node") {
     REQUIRE(result.requires_grad());
     REQUIRE(result.grad_fn().get() != nullptr);
     REQUIRE(result.grad_fn()->next_edges.size() == 1);
-    // x is a leaf: next_edges[0] must point to its AccumulateGrad node (non-null)
-    CHECK(result.grad_fn()->next_edges[0].get() != nullptr);
-    CHECK(result.grad_fn()->next_edges[0].get() == x.ensure_accumulate_grad_fn().get());
+    // x is a leaf: with AccumulateGrad eliminated, the edge is nullptr and the
+    // engine accumulates directly via saved_tensors[0].
+    CHECK(result.grad_fn()->next_edges[0].get() == nullptr);
 }
 
 TEST_CASE("SumBackward broadcasts scalar grad uniformly to input shape") {

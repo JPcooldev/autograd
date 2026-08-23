@@ -51,9 +51,9 @@ TEST_CASE("Tensor transpose creates dedicated backward node with inverse transpo
     REQUIRE(transposed.requires_grad());
     REQUIRE(transposed.grad_fn().get() != nullptr);
     REQUIRE(transposed.grad_fn()->next_edges.size() == 1);
-    // input is a leaf: next_edges[0] must point to its AccumulateGrad node (non-null)
-    CHECK(transposed.grad_fn()->next_edges[0].get() != nullptr);
-    CHECK(transposed.grad_fn()->next_edges[0].get() == input.ensure_accumulate_grad_fn().get());
+    // input is a leaf: with AccumulateGrad eliminated, the edge is nullptr and
+    // the engine accumulates directly via saved_tensors[0].
+    CHECK(transposed.grad_fn()->next_edges[0].get() == nullptr);
 
     const tensor::Tensor<float> propagated_grad = tensor::Tensor<float>::ones(transposed.shape(), false);
     const std::vector<tensor::Tensor<float>> grads = transposed.grad_fn()->apply(propagated_grad);

@@ -217,13 +217,69 @@ tensor::Tensor<T> tan(const tensor::Tensor<T>& x) {
     );
 }
 
+// ----- hyperbolic functions -----
+
+// sinh(x) = (exp(x) - exp(-x)) / 2
+template <typename T>
+tensor::Tensor<T> sinh(const tensor::Tensor<T>& x) {
+    std::vector<T> storage(static_cast<size_t>(x.numel()));
+    for (size_t i = 0; i < storage.size(); ++i)
+        storage[i] = static_cast<T>(std::sinh(x.data()[i]));
+
+    const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
+    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::SinhBackward<T>>(x);
+    return tensor::Tensor<T>::from_operation_result(
+        x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
+    );
+}
+
+// cosh(x) = (exp(x) + exp(-x)) / 2
+template <typename T>
+tensor::Tensor<T> cosh(const tensor::Tensor<T>& x) {
+    std::vector<T> storage(static_cast<size_t>(x.numel()));
+    for (size_t i = 0; i < storage.size(); ++i)
+        storage[i] = static_cast<T>(std::cosh(x.data()[i]));
+
+    const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
+    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::CoshBackward<T>>(x);
+    return tensor::Tensor<T>::from_operation_result(
+        x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
+    );
+}
+
+// tanh(x) = sinh(x) / cosh(x)
+template <typename T>
+tensor::Tensor<T> tanh(const tensor::Tensor<T>& x) {
+    std::vector<T> storage(static_cast<size_t>(x.numel()));
+    for (size_t i = 0; i < storage.size(); ++i)
+        storage[i] = static_cast<T>(std::tanh(x.data()[i]));
+
+    const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
+    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::TanhBackward<T>>(x);
+    return tensor::Tensor<T>::from_operation_result(
+        x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
+    );
+}
+
 // ----- other non-linear functions -----
 
+template <typename T>
+inline T sigmoid_scalar(T x) {
+    return static_cast<T>(1) / (static_cast<T>(1) + static_cast<T>(std::exp(-x)));
+}
+
+// sigmoid(x) = 1 / (1 + exp(-x))
 template <typename T>
 tensor::Tensor<T> sigmoid(const tensor::Tensor<T>& x) {
     std::vector<T> storage(static_cast<size_t>(x.numel()));
     for (size_t i = 0; i < storage.size(); ++i)
-        storage[i] = static_cast<T>(1) / (static_cast<T>(1) + static_cast<T>(std::exp(-x.data()[i])));
+        storage[i] = sigmoid_scalar(x.data()[i]);
 
     const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
     std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
@@ -234,6 +290,7 @@ tensor::Tensor<T> sigmoid(const tensor::Tensor<T>& x) {
     );
 }
 
+// relu(x) = max(0, x)
 template <typename T>
 tensor::Tensor<T> relu(const tensor::Tensor<T>& x) {
     std::vector<T> storage(static_cast<size_t>(x.numel()));
@@ -246,6 +303,47 @@ tensor::Tensor<T> relu(const tensor::Tensor<T>& x) {
         grad_fn = std::make_shared<autograd::ReluBackward<T>>(x);
     return tensor::Tensor<T>::from_operation_result(
         x.shape(), std::move(storage), requires_grad, std::move(grad_fn));
+}
+
+// SiLU (Sigmoid Linear Unit)
+// SiLU(x) = x * sigmoid(x)
+template <typename T>
+tensor::Tensor<T> silu(const tensor::Tensor<T>& x) {
+    std::vector<T> storage(static_cast<size_t>(x.numel()));
+    for (size_t i = 0; i < storage.size(); ++i)
+        storage[i] = x.data()[i] * sigmoid_scalar(x.data()[i]);
+
+    const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
+    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::SiLUBackward<T>>(x);
+    return tensor::Tensor<T>::from_operation_result(
+        x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
+    );
+}
+
+// GELU (Gaussian Error Linear Unit)
+// Approximated by:
+// GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+template <typename T>
+tensor::Tensor<T> gelu(const tensor::Tensor<T>& x) {
+    const T k = static_cast<T>(std::sqrt(2.0 / M_PI));  // sqrt(2/pi)
+    constexpr T c = static_cast<T>(0.044715);
+
+    std::vector<T> storage(static_cast<size_t>(x.numel()));
+    for (size_t i = 0; i < storage.size(); ++i) {
+        const T xi = x.data()[i];
+        const T u  = k * (xi + c * static_cast<T>(std::pow(xi, 3)));
+        storage[i] = static_cast<T>(0.5) * xi * (static_cast<T>(1) + static_cast<T>(std::tanh(u)));
+    }
+
+    const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
+    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::GELUBackward<T>>(x);
+    return tensor::Tensor<T>::from_operation_result(
+        x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
+    );
 }
 
 } // namespace ops

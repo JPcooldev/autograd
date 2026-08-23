@@ -67,8 +67,13 @@ methods:
     - sin()
     - cos()
     - tan()
+    - sinh()
+    - cosh()
+    - tanh()
     - sigmoid()
     - relu()
+    - silu()
+    - gelu()
 - reduction operations:
     - sum()
     - sum(dim)
@@ -76,6 +81,7 @@ methods:
     - mean(dim)
     - max()
     - min()
+    - softmax(dim)
 - backward:
     - backward()
 */
@@ -90,14 +96,16 @@ methods:
 // - creation paths requested by the project roadmap,
 // - explicit comments about ownership and lifetime semantics.
 
+#include <cmath>       // std::sqrt
 #include <cstdint>     // int64_t, uint64_t
 #include <limits>      // std::numeric_limits
 #include <memory>      // std::shared_ptr
 #include <optional>    // std::optional, std::nullopt
 #include <random>      // std::mt19937_64, distributions
 #include <stdexcept>   // std::invalid_argument, std::overflow_error
+#include <string>      // std::string
 #include <type_traits> // std::is_same
-#include <utility>     // std::move
+#include <utility>     // std::move, std::pair
 #include <vector>      // std::vector
 
 #include "dtype.h"
@@ -106,8 +114,6 @@ methods:
 namespace autograd {
 template <typename T>
 class Node;
-template <typename T>
-class AccumulateGrad;
 } // namespace autograd
 
 namespace tensor {
@@ -138,9 +144,19 @@ private:
     bool requires_grad_;
     // gradient function that produced this tensor
     std::shared_ptr<autograd::Node<T>> grad_fn_;
-    // AccumulateGrad node for this leaf (null for non-leaf / no-grad tensors).
-    // Created lazily on first call to ensure_accumulate_grad_fn().
-    mutable std::shared_ptr<autograd::Node<T>> accumulate_grad_fn_;
+
+    // Gradient storage for leaf tensors (requires_grad=true, no grad_fn).
+    //
+    // Allocated at construction for leaves so alias() can copy the shared_ptr
+    // and both the original tensor and every saved alias point to the same
+    // GradStorage object.  accumulate_grad() writes into GradStorage::tensor;
+    // zero_grad() resets it to nullptr.  grad() returns GradStorage::tensor.get().
+    //
+    // Null for operation results (non-leaves) and no-grad tensors.
+    struct GradStorage {
+        std::shared_ptr<Tensor<T>> tensor;  // null until first accumulate_grad()
+    };
+    mutable std::shared_ptr<GradStorage> grad_storage_;
 
     /**
      * Infers the dtype of a tensor from the compile-time type T.
@@ -230,7 +246,10 @@ private:
         base_ptr_(nullptr),
         requires_grad_(grad_allowed(requires_grad, infer_dtype())),
         grad_fn_(std::move(grad_fn)),
-        accumulate_grad_fn_(nullptr)
+        // Allocate GradStorage only for leaves (grad_fn_ == nullptr) that require grad.
+        // Operation results have a grad_fn and must not accumulate grad here.
+        grad_storage_(!grad_fn_ && grad_allowed(requires_grad, infer_dtype())
+                      ? std::make_shared<GradStorage>() : nullptr)
     {
         const int64_t expected = compute_numel(shape_);
         if (static_cast<int64_t>(data_ptr_->size()) != expected) {
@@ -319,7 +338,8 @@ public:
         base_ptr_(nullptr),
         requires_grad_(grad_allowed(requires_grad, infer_dtype())),
         grad_fn_(nullptr),
-        accumulate_grad_fn_(nullptr)
+        grad_storage_(grad_allowed(requires_grad, infer_dtype())
+                  ? std::make_shared<GradStorage>() : nullptr)
     {}
 
     /**
@@ -368,7 +388,8 @@ public:
         base_ptr_(nullptr),
         requires_grad_(grad_allowed(requires_grad, infer_dtype())),
         grad_fn_(nullptr),
-        accumulate_grad_fn_(nullptr)
+        grad_storage_(grad_allowed(requires_grad, infer_dtype())
+                  ? std::make_shared<GradStorage>() : nullptr)
     {
         const int64_t expected = compute_numel(shape_);
         if (static_cast<int64_t>(values.size()) != expected)
@@ -402,7 +423,7 @@ public:
         base_ptr_(nullptr),
         requires_grad_(grad_allowed(requires_grad, infer_dtype())),
         grad_fn_(nullptr),
-        accumulate_grad_fn_(nullptr)
+        grad_storage_(nullptr)   // set after validation below
     {   
         // validate the array pointer and count
         if (count < 0)
@@ -414,6 +435,8 @@ public:
             throw std::invalid_argument("array pointer must not be null when count > 0");
         // copy the array into new tensor-owned storage
         data_ptr_ = std::make_shared<std::vector<T>>(values, values + static_cast<size_t>(count));
+        grad_storage_ = grad_allowed(requires_grad_, infer_dtype())
+                    ? std::make_shared<GradStorage>() : nullptr;
     }
 
     // ----- tensor factory methods -----
@@ -438,13 +461,21 @@ public:
     }
 
     // Creates a lightweight alias that shares the same underlying storage as
-    // `source` without copying any data. The alias has requires_grad=false and
-    // no grad_fn / accumulate_grad_fn, so it is inert with respect to autograd.
+    // `source` without copying any data.
     //
-    // This is used by Node::snapshot_tensor() for leaf tensors (parameters,
-    // user inputs): their storage is kept alive by the caller, so a shared
-    // reference is safe and avoids the O(N) copy cost of a full snapshot.
+    // Both data_ptr_ and grad_storage_ are copied (shared_ptr copy — no allocation).
+    // Because leaf tensors pre-allocate their GradStorage at construction time,
+    // the alias and the original share the same GradStorage object.
+    // When the engine calls accumulate_grad() on the alias, GradStorage::tensor
+    // is set and immediately visible on the original through tensor.grad().
     //
+    // requires_grad_ is kept so the engine can distinguish leaf-grad inputs
+    // (needs accumulation) from no-grad inputs (nullptr edge, skip).
+    // grad_fn_ is stripped because an alias is not itself a graph operation.
+    //
+    // Caution: in-place mutation of the source between forward and backward
+    // will be observed by the alias (no version counter guard here).
+
     // Caution: if the source tensor is mutated in-place after the forward pass
     // but before backward(), the backward computation will observe the mutated
     // values. This mirrors PyTorch's behaviour (which detects such mutations via
@@ -461,13 +492,8 @@ public:
      * @return A new tensor that is an alias of the tensor.
      */
     static Tensor<T> alias(const Tensor<T>& source) {
-        // increase ref count for shared pointers (data_ptr_, base_ptr_, grad_fn_ and accumulate_grad_fn_)
-        // deep copy metadata
-        Tensor<T> t(source);
-        t.requires_grad_ = false;
-        // decrease ref count by setting it to nullptr (disconnect from computation graph)
-        t.grad_fn_ = nullptr;
-        t.accumulate_grad_fn_ = nullptr;
+        Tensor<T> t(source);    // copies all shared_ptrs including grad_storage_
+        t.grad_fn_ = nullptr;   // strip: alias is not a graph operation result
         return t;
     }
 
@@ -489,7 +515,8 @@ public:
         view.offset_ = offset;
         view.base_ptr_ = std::make_shared<Tensor<T>>(source);
         view.requires_grad_ = requires_grad;
-        view.grad_fn_      = std::move(grad_fn);
+        view.grad_fn_       = std::move(grad_fn);
+        view.grad_storage_      = nullptr; // operation-produced views are non-leaf
         return view;
     }
 
@@ -736,6 +763,158 @@ public:
      */
     ~Tensor() = default;
 
+    // ----- init methods -----
+
+    /**
+     * Computes fan_in and fan_out for a weight tensor.
+     *
+     * For a 2-D tensor of shape [out, in]: fan_in = in, fan_out = out.
+     * For higher-rank tensors (e.g. conv weights [out, in, *k]):
+     *   the kernel dimensions are folded into both fan values.
+     *
+     * @param[in] shape The shape of the weight tensor (rank >= 1).
+     * @return A pair {fan_in, fan_out}.
+     */
+    static std::pair<int64_t, int64_t> compute_fans(const std::vector<int64_t>& shape) {
+        if (shape.size() < 2) {
+            return {shape[0], shape[0]};
+        }
+        int64_t fan_in  = shape[1];
+        int64_t fan_out = shape[0];
+        for (size_t i = 2; i < shape.size(); ++i) {
+            fan_in  *= shape[i];
+            fan_out *= shape[i];
+        }
+        return {fan_in, fan_out};
+    }
+
+    /**
+     * Xavier / Glorot uniform initialization: U[-limit, limit]
+     * where limit = gain * sqrt(6 / (fan_in + fan_out)).
+     *
+     * @param[in] shape The shape of the tensor.
+     * @param[in] gain  Scaling factor (default: 1.0).
+     * @param[in] requires_grad Whether the tensor requires gradients (default: true).
+     * @param[in] seed  Optional RNG seed.
+     * @return A new tensor initialized with Xavier uniform values.
+     */
+    static Tensor<T> xavier_uniform(
+        const std::vector<int64_t>& shape,
+        double gain = 1.0,
+        bool requires_grad = true,
+        std::optional<uint64_t> seed = std::nullopt
+    ) {
+        auto [fan_in, fan_out] = compute_fans(shape);
+        const double limit = gain * std::sqrt(6.0 / static_cast<double>(fan_in + fan_out));
+        const int64_t n = compute_numel(shape);
+        std::vector<T> storage(static_cast<size_t>(n));
+        std::mt19937_64 rng{seed.has_value() ? *seed : std::random_device{}()};
+        std::uniform_real_distribution<double> dist(-limit, limit);
+        for (auto& v : storage)
+            v = static_cast<T>(dist(rng));
+        return Tensor<T>::from_operation_result(shape, std::move(storage), requires_grad, nullptr);
+    }
+
+    /**
+     * Xavier / Glorot normal initialization: N(0, std)
+     * where std = gain * sqrt(2 / (fan_in + fan_out)).
+     *
+     * @param[in] shape The shape of the tensor.
+     * @param[in] gain  Scaling factor (default: 1.0).
+     * @param[in] requires_grad Whether the tensor requires gradients (default: true).
+     * @param[in] seed  Optional RNG seed.
+     * @return A new tensor initialized with Xavier normal values.
+     */
+    static Tensor<T> xavier_normal(
+        const std::vector<int64_t>& shape,
+        double gain = 1.0,
+        bool requires_grad = true,
+        std::optional<uint64_t> seed = std::nullopt
+    ) {
+        auto [fan_in, fan_out] = compute_fans(shape);
+        const double std = gain * std::sqrt(2.0 / static_cast<double>(fan_in + fan_out));
+        const int64_t n = compute_numel(shape);
+        std::vector<T> storage(static_cast<size_t>(n));
+        std::mt19937_64 rng{seed.has_value() ? *seed : std::random_device{}()};
+        std::normal_distribution<double> dist(0.0, std);
+        for (auto& v : storage)
+            v = static_cast<T>(dist(rng));
+        return Tensor<T>::from_operation_result(shape, std::move(storage), requires_grad, nullptr);
+    }
+
+    /**
+     * Kaiming / He uniform initialization: U[-bound, bound]
+     * where bound = sqrt(3) * gain / sqrt(fan)
+     * and   gain  = sqrt(2 / (1 + negative_slope^2)).
+     *
+     * @param[in] shape          The shape of the tensor.
+     * @param[in] negative_slope Negative slope of the activation (0.0 for ReLU, default: 0.0).
+     * @param[in] fan_mode       Which fan to use: "fan_in" (default) or "fan_out".
+     * @param[in] requires_grad  Whether the tensor requires gradients (default: true).
+     * @param[in] seed           Optional RNG seed.
+     * @return A new tensor initialized with Kaiming uniform values.
+     * @throws std::invalid_argument if fan_mode is neither "fan_in" nor "fan_out".
+     */
+    static Tensor<T> kaiming_uniform(
+        const std::vector<int64_t>& shape,
+        double negative_slope = 0.0,
+        const std::string& fan_mode = "fan_in",
+        bool requires_grad = true,
+        std::optional<uint64_t> seed = std::nullopt
+    ) {
+        auto [fan_in, fan_out] = compute_fans(shape);
+        int64_t fan;
+        if (fan_mode == "fan_in")       fan = fan_in;
+        else if (fan_mode == "fan_out") fan = fan_out;
+        else throw std::invalid_argument("kaiming_uniform: fan_mode must be \"fan_in\" or \"fan_out\"");
+        const double gain  = std::sqrt(2.0 / (1.0 + negative_slope * negative_slope));
+        const double bound = std::sqrt(3.0) * gain / std::sqrt(static_cast<double>(fan));
+        const int64_t n = compute_numel(shape);
+        std::vector<T> storage(static_cast<size_t>(n));
+        std::mt19937_64 rng{seed.has_value() ? *seed : std::random_device{}()};
+        std::uniform_real_distribution<double> dist(-bound, bound);
+        for (auto& v : storage)
+            v = static_cast<T>(dist(rng));
+        return Tensor<T>::from_operation_result(shape, std::move(storage), requires_grad, nullptr);
+    }
+
+    /**
+     * Kaiming / He normal initialization: N(0, std)
+     * where std  = gain / sqrt(fan)
+     * and   gain = sqrt(2 / (1 + negative_slope^2)).
+     *
+     * @param[in] shape          The shape of the tensor.
+     * @param[in] negative_slope Negative slope of the activation (0.0 for ReLU, default: 0.0).
+     * @param[in] fan_mode       Which fan to use: "fan_in" (default) or "fan_out".
+     * @param[in] requires_grad  Whether the tensor requires gradients (default: true).
+     * @param[in] seed           Optional RNG seed.
+     * @return A new tensor initialized with Kaiming normal values.
+     * @throws std::invalid_argument if fan_mode is neither "fan_in" nor "fan_out".
+     */
+    static Tensor<T> kaiming_normal(
+        const std::vector<int64_t>& shape,
+        double negative_slope = 0.0,
+        const std::string& fan_mode = "fan_in",
+        bool requires_grad = true,
+        std::optional<uint64_t> seed = std::nullopt
+    ) {
+        auto [fan_in, fan_out] = compute_fans(shape);
+        int64_t fan;
+        if (fan_mode == "fan_in")       fan = fan_in;
+        else if (fan_mode == "fan_out") fan = fan_out;
+        else throw std::invalid_argument("kaiming_normal: fan_mode must be \"fan_in\" or \"fan_out\"");
+        const double gain = std::sqrt(2.0 / (1.0 + negative_slope * negative_slope));
+        const double std  = gain / std::sqrt(static_cast<double>(fan));
+        const int64_t n = compute_numel(shape);
+        std::vector<T> storage(static_cast<size_t>(n));
+        std::mt19937_64 rng{seed.has_value() ? *seed : std::random_device{}()};
+        std::normal_distribution<double> dist(0.0, std);
+        for (auto& v : storage)
+            v = static_cast<T>(dist(rng));
+        return Tensor<T>::from_operation_result(shape, std::move(storage), requires_grad, nullptr);
+    }
+
+
     // ----- accessors -----
 
     int64_t rank() const {
@@ -862,8 +1041,13 @@ public:
     Tensor<T> sin() const;
     Tensor<T> cos() const;
     Tensor<T> tan() const;
+    Tensor<T> sinh() const;
+    Tensor<T> cosh() const;
+    Tensor<T> tanh() const;
     Tensor<T> sigmoid() const;
     Tensor<T> relu() const;
+    Tensor<T> silu() const;
+    Tensor<T> gelu() const;
 
     // ----- reduction operations -----
     Tensor<T> sum() const;
@@ -872,6 +1056,7 @@ public:
     Tensor<T> mean(int64_t dim) const;
     Tensor<T> max() const;
     Tensor<T> min() const;
+    Tensor<T> softmax(int64_t dim) const;
 
     // ----- linalg operations -----
     Tensor<T> dot(const Tensor<T>& other) const;
@@ -879,9 +1064,16 @@ public:
 
     // ----- grad / backward -----
     bool is_leaf() const { return grad_fn_ == nullptr; }
+
+    // Returns the accumulated gradient tensor, or nullptr if backward has not
+    // been called yet (or this tensor does not require grad).
     const Tensor<T>* grad() const;
+
+    // Accumulate `grad` into this tensor's gradient buffer (engine-internal).
+    void accumulate_grad(const Tensor<T>& grad);
+
+    // Clear the gradient buffer. Call before each backward pass.
     void zero_grad() const;
-    const std::shared_ptr<autograd::Node<T>>& ensure_accumulate_grad_fn() const;
 
     // ----- backward -----
     Tensor<T> backward() const;

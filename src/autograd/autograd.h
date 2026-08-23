@@ -10,8 +10,7 @@
 // Layer 2: backward nodes (included transitively by the op headers below,
 // but listed here for documentation of the dependency order)
 
-// Layer 2.5: AccumulateGrad (leaf-tensor terminal node) and backward engine
-#include "accumulate_grad.h"
+// Layer 2.5: backward engine
 #include "engine.h"
 
 // Layer 3: forward ops (each header includes its own backward nodes)

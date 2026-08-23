@@ -25,11 +25,11 @@ public:
 
     // Returns the correct backward edge for tensor x:
     //   - intermediate tensor (has grad_fn)  → its grad_fn
-    //   - leaf tensor that requires_grad      → its AccumulateGrad node (created lazily)
+    //   - leaf tensor that requires_grad      → nullptr  (engine accumulates via
+    //                                           saved_tensors, no AccumulateGrad node)
     //   - no-grad tensor                      → nullptr (gradient not needed)
     static std::shared_ptr<Node<T>> get_next_edge(const Tensor<T>& x) {
         if (x.grad_fn()) return x.grad_fn();
-        if (x.requires_grad()) return x.ensure_accumulate_grad_fn();
         return nullptr;
     }
 

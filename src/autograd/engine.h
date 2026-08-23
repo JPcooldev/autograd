@@ -53,7 +53,8 @@ void accumulate_into(tensor::Tensor<T>& dst, const tensor::Tensor<T>& src) {
 //      Seed it with root_fn → initial_grad.
 //   3. For each node in order: call apply(accumulated_grad), then distribute
 //      the returned per-input gradients to next_edges accumulators.
-//   4. AccumulateGrad::apply() stores the final gradient on the leaf tensor.
+//   4. For nullptr edges where the saved input requires grad, accumulate the
+//      gradient directly into the tensor's shared grad buffer (tensor.grad()).
 template <typename T>
 void run_backward(
     const std::shared_ptr<Node<T>>& root_fn,
@@ -86,16 +87,21 @@ void run_backward(
         const size_t n_edges = node->next_edges.size();
         for (size_t i = 0; i < n_edges && i < input_grads.size(); ++i) {
             Node<T>* next = node->next_edges[i].get();
-            if (!next)
-                continue;
-
-            auto acc_it = accumulators.find(next);
-            if (acc_it == accumulators.end()) {
-                accumulators.emplace(next,
-                    tensor::Tensor<T>(input_grads[i].shape(),
-                                      input_grads[i].data(), false));
-            } else {
-                detail::accumulate_into(acc_it->second, input_grads[i]);
+            if (next) {
+                // Non-leaf: propagate gradient to the next backward node.
+                auto acc_it = accumulators.find(next);
+                if (acc_it == accumulators.end()) {
+                    accumulators.emplace(next,
+                        tensor::Tensor<T>(input_grads[i].shape(),
+                                          input_grads[i].data(), false));
+                } else {
+                    detail::accumulate_into(acc_it->second, input_grads[i]);
+                }
+            } else if (i < node->saved_tensors.size() &&
+                       node->saved_tensors[i].requires_grad()) {
+                // Leaf input: accumulate gradient directly into the shared
+                // grad buffer (visible on the original tensor via tensor.grad()).
+                node->saved_tensors[i].accumulate_grad(input_grads[i]);
             }
         }
     }
