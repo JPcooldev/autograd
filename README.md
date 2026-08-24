@@ -22,15 +22,9 @@ src/
     └── backward_ops/         # Concrete backward Node subclasses
 ```
 
-## C++ style
-- always first define private members and then public members
-- {} blocks are always indented at the same level 
-
-
 ## Tests
 - use `doctest` framework. its docs are available [here](doctest-docs)
-- run tests using `g++-15` compiler
-- use `scripts/run_tests.sh` to build and run tests
+- `scripts/run_tests.sh` builds with `g++-14` (C++17) and runs the suite
 
 ```zsh
 # run all tests

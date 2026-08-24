@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 #include "../tensor/tensor.h"
 #include "../autograd/grad_context.h"
@@ -350,6 +352,151 @@ tensor::Tensor<T> unsqueeze(const tensor::Tensor<T>& x, int64_t dim) {
         requires_grad,
         std::move(grad_fn)
     );
+}
+
+// Copy logical elements of `x` into a new dense row-major buffer using
+//   index = offset + sum_d idx[d] * strides[d]
+template <typename T>
+std::vector<T> copy_to_contiguous_storage(const tensor::Tensor<T>& x)
+{
+    const int64_t n = x.numel();
+    std::vector<T> out(static_cast<size_t>(n));
+    if (n == 0)
+        return out;
+
+    const int64_t rank = x.rank();
+    const auto& shape = x.shape();
+    const auto& strides = x.strides();
+    const int64_t offset = x.offset();
+    const auto& buf = x.data();
+    const auto contig_strides = tensor::Tensor<T>::compute_contiguous_strides(shape);
+
+    for (int64_t i = 0; i < n; ++i) {
+        int64_t remaining = i;
+        int64_t pos = offset;
+        for (int64_t d = 0; d < rank; ++d) {
+            const int64_t idx = remaining / contig_strides[static_cast<size_t>(d)];
+            remaining %= contig_strides[static_cast<size_t>(d)];
+            pos += idx * strides[static_cast<size_t>(d)];
+        }
+        out[static_cast<size_t>(i)] = buf[static_cast<size_t>(pos)];
+    }
+    return out;
+}
+
+// Return a tensor whose logical order is packed into a dense row-major buffer.
+// Fast path: already contiguous and offset == 0 → same storage, no extra node.
+template <typename T>
+tensor::Tensor<T> contiguous(const tensor::Tensor<T>& x)
+{
+    if (x.is_contiguous() && x.offset() == 0)
+        return x;
+
+    std::vector<T> storage = copy_to_contiguous_storage(x);
+
+    const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
+    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::ContiguousBackward<T>>(x);
+
+    return tensor::Tensor<T>::from_operation_result(
+        x.shape(), std::move(storage), requires_grad, std::move(grad_fn));
+}
+
+// narrow: view of a slice along `dim` of length `length` starting at `start`.
+template <typename T>
+tensor::Tensor<T> narrow(
+    const tensor::Tensor<T>& x,
+    int64_t dim,
+    int64_t start,
+    int64_t length
+) {
+    if (x.rank() == 0)
+        throw std::invalid_argument("narrow: input must be non-scalar");
+    dim = tensor::Tensor<T>::normalize_dimension(dim, x.rank());
+    const int64_t size = x.shape()[static_cast<size_t>(dim)];
+    if (start < 0 || length < 0 || start + length > size)
+        throw std::invalid_argument("narrow: start/length out of range");
+
+    auto shape = x.shape();
+    shape[static_cast<size_t>(dim)] = length;
+    const int64_t new_offset = x.offset() + start * x.strides()[static_cast<size_t>(dim)];
+
+    const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
+    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::NarrowBackward<T>>(x, dim, start);
+
+    return tensor::Tensor<T>::from_view(
+        x, std::move(shape), x.strides(), new_offset, requires_grad, std::move(grad_fn));
+}
+
+// cat: concatenate tensors along `dim`. Inputs are copied into a new buffer.
+template <typename T>
+tensor::Tensor<T> cat(const std::vector<tensor::Tensor<T>>& tensors, int64_t dim)
+{
+    if (tensors.empty())
+        throw std::invalid_argument("cat: expected at least one tensor");
+
+    const int64_t rank = tensors[0].rank();
+    if (rank == 0)
+        throw std::invalid_argument("cat: cannot concatenate scalars");
+    dim = tensor::Tensor<T>::normalize_dimension(dim, rank);
+
+    auto out_shape = tensors[0].shape();
+    out_shape[static_cast<size_t>(dim)] = 0;
+    bool any_grad = false;
+    std::vector<tensor::Tensor<T>> contig;
+    contig.reserve(tensors.size());
+    for (const auto& t : tensors) {
+        if (t.rank() != rank)
+            throw std::invalid_argument("cat: all tensors must have the same rank");
+        for (int64_t d = 0; d < rank; ++d) {
+            if (d == dim) continue;
+            if (t.shape()[static_cast<size_t>(d)] != out_shape[static_cast<size_t>(d)])
+                throw std::invalid_argument("cat: tensor shapes must match except on cat dim");
+        }
+        out_shape[static_cast<size_t>(dim)] += t.shape()[static_cast<size_t>(dim)];
+        any_grad = any_grad || t.requires_grad();
+        contig.push_back(contiguous(t));
+    }
+
+    const int64_t out_n = tensor::Tensor<T>::compute_numel(out_shape);
+    std::vector<T> storage(static_cast<size_t>(out_n));
+    const auto out_strides = tensor::Tensor<T>::compute_contiguous_strides(out_shape);
+
+    int64_t dim_offset = 0;
+    for (const auto& t : contig) {
+        const auto& in_shape = t.shape();
+        const auto in_strides = tensor::Tensor<T>::compute_contiguous_strides(in_shape);
+        const auto& td = t.data();
+        for (int64_t f = 0; f < t.numel(); ++f) {
+            int64_t remaining = f;
+            int64_t out_f = 0;
+            for (int64_t d = 0; d < rank; ++d) {
+                int64_t idx = remaining / in_strides[static_cast<size_t>(d)];
+                remaining %= in_strides[static_cast<size_t>(d)];
+                if (d == dim) idx += dim_offset;
+                out_f += idx * out_strides[static_cast<size_t>(d)];
+            }
+            storage[static_cast<size_t>(out_f)] = td[static_cast<size_t>(f)];
+        }
+        dim_offset += in_shape[static_cast<size_t>(dim)];
+    }
+
+    const bool requires_grad = autograd::is_grad_enabled() && any_grad;
+    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::CatBackward<T>>(tensors, dim);
+
+    return tensor::Tensor<T>::from_operation_result(
+        out_shape, std::move(storage), requires_grad, std::move(grad_fn));
+}
+
+template <typename T>
+tensor::Tensor<T> cat(std::initializer_list<tensor::Tensor<T>> tensors, int64_t dim)
+{
+    return cat(std::vector<tensor::Tensor<T>>(tensors), dim);
 }
 
 } // namespace ops

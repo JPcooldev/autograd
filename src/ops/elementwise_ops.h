@@ -171,6 +171,21 @@ tensor::Tensor<T> log(const tensor::Tensor<T>& x) {
     );
 }
 
+template <typename T>
+tensor::Tensor<T> sqrt(const tensor::Tensor<T>& x) {
+    std::vector<T> storage(static_cast<size_t>(x.numel()));
+    for (size_t index = 0; index < storage.size(); ++index)
+        storage[index] = static_cast<T>(std::sqrt(x.data()[index]));
+
+    const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
+    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::SqrtBackward<T>>(x);
+    return tensor::Tensor<T>::from_operation_result(
+        x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
+    );
+}
+
 // ----- trigonometric functions -----
 template <typename T>
 tensor::Tensor<T> sin(const tensor::Tensor<T>& x) {

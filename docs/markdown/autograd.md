@@ -220,6 +220,7 @@ There is no support for:
 | `FlattenBackward` | `grad.reshape(original_shape)` |
 | `SqueezeBackward` | `grad.reshape(original_shape)` |
 | `UnsqueezeBackward` | `grad.squeeze(dim)` |
+| `CastBackward<Out, In>` | Recast `grad` from `Out` to `In`. Same-type is identity; cross-type bridges into the input graph. |
 
 `sum_to` is an internal helper that reduces a gradient tensor to a target shape by summing along all dimensions that were broadcast or added.
 

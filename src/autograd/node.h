@@ -50,6 +50,17 @@ public:
         next_edges.emplace_back(get_next_edge(x));
         next_edges.emplace_back(get_next_edge(y));
     }
+
+    Node(const Tensor<T>& x, const Tensor<T>& y, const Tensor<T>& z) {
+        saved_tensors.reserve(3);
+        next_edges.reserve(3);
+        saved_tensors.emplace_back(Tensor<T>::alias(x));
+        saved_tensors.emplace_back(Tensor<T>::alias(y));
+        saved_tensors.emplace_back(Tensor<T>::alias(z));
+        next_edges.emplace_back(get_next_edge(x));
+        next_edges.emplace_back(get_next_edge(y));
+        next_edges.emplace_back(get_next_edge(z));
+    }
 };  
 
 } // namespace autograd

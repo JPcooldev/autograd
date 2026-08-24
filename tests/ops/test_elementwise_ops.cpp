@@ -176,3 +176,64 @@ TEST_CASE_TEMPLATE("ops::relu passes positive values unchanged", T, float, int) 
     for (size_t i = 0; i < result.data().size(); ++i)
         CHECK(result.data()[i] == a.data()[i]);
 }
+
+TEST_CASE("ops::sinh 2x2") {
+    const tensor::Tensor<float> a({2, 2}, std::vector<float>{0.f, 1.f, -1.f, 0.5f}, false);
+    const auto result = a.sinh();
+    const std::vector<float> expected{
+        0.f,
+        std::sinh(1.f),
+        std::sinh(-1.f),
+        std::sinh(0.5f)
+    };
+    for (size_t i = 0; i < expected.size(); ++i)
+        CHECK(result.data()[i] == doctest::Approx(expected[i]));
+}
+
+TEST_CASE("ops::cosh 2x2") {
+    const tensor::Tensor<float> a({2}, std::vector<float>{0.f, 1.f}, false);
+    const auto result = a.cosh();
+    CHECK(result.data()[0] == doctest::Approx(1.f));
+    CHECK(result.data()[1] == doctest::Approx(std::cosh(1.f)));
+}
+
+TEST_CASE("ops::tanh 2x2") {
+    const tensor::Tensor<float> a({2}, std::vector<float>{0.f, 1.f}, false);
+    const auto result = a.tanh();
+    CHECK(result.data()[0] == doctest::Approx(0.f));
+    CHECK(result.data()[1] == doctest::Approx(std::tanh(1.f)));
+}
+
+TEST_CASE("ops::silu is x * sigmoid(x)") {
+    const tensor::Tensor<float> a({2}, std::vector<float>{0.f, 2.f}, false);
+    const auto result = a.silu();
+    const float sig2 = 1.f / (1.f + std::exp(-2.f));
+    CHECK(result.data()[0] == doctest::Approx(0.f));
+    CHECK(result.data()[1] == doctest::Approx(2.f * sig2));
+}
+
+TEST_CASE("ops::gelu tanh approximation") {
+    const tensor::Tensor<float> a({2}, std::vector<float>{0.f, 1.f}, false);
+    const auto result = a.gelu();
+    const float k = static_cast<float>(std::sqrt(2.0 / 3.14159265358979323846));
+    const float x = 1.f;
+    const float expected = 0.5f * x * (1.f + std::tanh(k * (x + 0.044715f * x * x * x)));
+    CHECK(result.data()[0] == doctest::Approx(0.f));
+    CHECK(result.data()[1] == doctest::Approx(expected));
+}
+
+TEST_CASE("ops::sqrt 1-D") {
+    const tensor::Tensor<float> a({2}, std::vector<float>{4.f, 9.f}, false);
+    const auto result = ops::sqrt(a);
+    CHECK(result.shape() == std::vector<int64_t>{2});
+    CHECK(result.data()[0] == doctest::Approx(2.f));
+    CHECK(result.data()[1] == doctest::Approx(3.f));
+}
+
+TEST_CASE("ops::sqrt backward is 0.5 / sqrt(x)") {
+    tensor::Tensor<float> x({2}, std::vector<float>{4.f, 9.f}, true);
+    x.sqrt().sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(0.25f));
+    CHECK(x.grad()->data()[1] == doctest::Approx(1.f / 6.f));
+}

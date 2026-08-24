@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <vector>
 #include <memory>
 
@@ -131,6 +132,24 @@ public:
         const Tensor<T> exp_x = x.exp();
         const Tensor<T> grad_x = exp_x.multiply(propagated_grad);
         return {grad_x};
+    }
+};
+
+template <typename T>
+class SqrtBackward : public Node<T> {
+public:
+    explicit SqrtBackward(const Tensor<T>& x) : Node<T>(x) {}
+
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
+        const Tensor<T>& x = this->saved_tensors[0];
+        std::vector<T> storage(static_cast<size_t>(x.numel()));
+        const auto& xd = x.data();
+        const auto& gd = propagated_grad.data();
+        for (size_t i = 0; i < storage.size(); ++i) {
+            const T s = static_cast<T>(std::sqrt(static_cast<double>(xd[i])));
+            storage[i] = gd[i] * static_cast<T>(0.5) / s;
+        }
+        return {Tensor<T>::from_operation_result(x.shape(), std::move(storage), false, nullptr)};
     }
 };
 

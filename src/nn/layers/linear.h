@@ -21,7 +21,7 @@ namespace nn {
 template <typename T>
 class Identity : public Layer<T> {
 public:
-    tensor::Tensor<T> forward(const tensor::Tensor<T>& input) const override {
+    tensor::Tensor<T> forward(const tensor::Tensor<T>& input) const {
         return input;
     }
     // std::vector<tensor::Tensor<T>*> parameters() override {
@@ -35,8 +35,9 @@ public:
 // Fully-connected layer:  y = x @ W.T + b   (or  y = x @ W.T  when bias=false)
 //
 // Parameters
-//   weight  shape {out_features, in_features}  — initialised N(0, 1/√in)
-//   bias    shape {out_features}               — initialised to zero
+//   weight  shape {out_features, in_features}  — kaiming_uniform(a=√5)
+//                                                 = U(-1/√fan_in, 1/√fan_in)
+//   bias    shape {out_features}               — U(-1/√fan_in, 1/√fan_in)
 //                                                 present only when use_bias=true
 //
 // Forward input shapes:
@@ -62,20 +63,24 @@ public:
     std::optional<tensor::Tensor<T>> bias;
 
     Linear(int64_t in_features, int64_t out_features, bool use_bias = true)
-        : weight(tensor::Tensor<T>::random_gaussian(
+        : weight(tensor::Tensor<T>::kaiming_uniform(
               {out_features, in_features},
-              T{0},
-              static_cast<T>(1.0 / std::sqrt(static_cast<double>(in_features))),
+              std::sqrt(5.0),
+              "fan_in",
               true)),
-          bias(use_bias
-               ? std::optional<tensor::Tensor<T>>(
-                     tensor::Tensor<T>::zeros({out_features}, true))
-               : std::nullopt),
           in_features_(in_features),
           out_features_(out_features)
-    {}
+    {
+        if (use_bias) {
+            auto [fan_in, fan_out] = tensor::Tensor<T>::compute_fans(weight.shape());
+            (void)fan_out;
+            const T bound = static_cast<T>(
+                1.0 / std::sqrt(static_cast<double>(fan_in)));
+            bias = tensor::Tensor<T>::uniform({out_features}, -bound, bound, true);
+        }
+    }
 
-    tensor::Tensor<T> forward(const tensor::Tensor<T>& input) const override {
+    tensor::Tensor<T> forward(const tensor::Tensor<T>& input) const {
         if (input.rank() == 1) {
             if (input.shape()[0] != in_features_)
                 throw std::invalid_argument(
@@ -98,7 +103,7 @@ public:
             const int64_t batch = input.shape()[0];
             auto out = ops::matmul(input, weight.transpose());  // {batch, out}
             if (bias) {
-                auto b = bias->unsqueeze(0).broadcast_to({batch, out_features_});
+                auto b = bias->unsqueeze(0).broadcast_to({batch, out_features_}).contiguous();
                 return ops::add(out, b);
             }
             return out;

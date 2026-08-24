@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -356,6 +357,36 @@ TEST_CASE("reduction ops produce no grad_fn when all inputs are no-grad") {
     CHECK(x.mean(0).grad_fn()  .get() == nullptr);
     CHECK(x.max().grad_fn()    .get() == nullptr);
     CHECK(x.min().grad_fn()    .get() == nullptr);
+}
+
+TEST_CASE("softmax along dim=1 normalizes each row") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 1.f, 1.f, 1.f}, false);
+    const auto s = x.softmax(1);
+
+    REQUIRE(s.shape() == std::vector<int64_t>{2, 3});
+    const float row0 = std::exp(1.f) + std::exp(2.f) + std::exp(3.f);
+    CHECK(s.data()[0] == doctest::Approx(std::exp(1.f) / row0));
+    CHECK(s.data()[1] == doctest::Approx(std::exp(2.f) / row0));
+    CHECK(s.data()[2] == doctest::Approx(std::exp(3.f) / row0));
+    CHECK(s.data()[3] == doctest::Approx(1.f / 3.f));
+    CHECK(s.data()[4] == doctest::Approx(1.f / 3.f));
+    CHECK(s.data()[5] == doctest::Approx(1.f / 3.f));
+}
+
+TEST_CASE("SoftmaxBackward matches s * (g - sum(g * s))") {
+    const tensor::Tensor<float> x({2}, std::vector<float>{1.f, 2.f}, true);
+    const auto s = x.softmax(0);
+    REQUIRE(s.grad_fn().get() != nullptr);
+
+    const tensor::Tensor<float> g({2}, std::vector<float>{1.f, 0.f}, false);
+    const auto grads = s.grad_fn()->apply(g);
+
+    REQUIRE(grads.size() == 1);
+    const float s0 = s.data()[0];
+    const float s1 = s.data()[1];
+    // dx_i = s_i * (g_i - s_0) when g = [1, 0]
+    CHECK(grads[0].data()[0] == doctest::Approx(s0 * (1.f - s0)));
+    CHECK(grads[0].data()[1] == doctest::Approx(s1 * (0.f - s0)));
 }
 
 TEST_CASE("reduction ops wire next_edge to input grad_fn") {

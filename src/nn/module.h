@@ -25,7 +25,7 @@ namespace nn {
 //           register_module("fc2", fc2);
 //       }
 //
-//       tensor::Tensor<float> forward(const tensor::Tensor<float>& x) const override {
+//       tensor::Tensor<float> forward(const tensor::Tensor<float>& x) const {
 //           return fc2.forward(ops::relu(fc1.forward(x)));
 //       }
 //   };
@@ -69,6 +69,13 @@ public:
                     "Module::register_parameter: '" + name + "' is already registered");
         }
         own_params_.push_back(&param);
+    }
+
+    // Recurse train/eval into every registered sub-module.
+    void train(bool mode = true) override {
+        Layer<T>::train(mode);
+        for (auto* mod : submodules_)
+            mod->train(mode);
     }
 
     // Recursively collects all learnable parameters from own_params_ and every

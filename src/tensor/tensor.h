@@ -26,13 +26,12 @@ methods:
     - is_contiguous()
     - grad_fn()
     - data()
-- casting methods: (float32 for now)
+- casting methods:
     - to()
     - float32()
     - float64()
     - int32()
     - int64()
-    - bool_()
 - fill constructors:
     - zeros()
     - ones()
@@ -54,6 +53,7 @@ methods:
     - flatten()
     - squeeze()
     - unsqueeze()
+    - contiguous()
 - elementwise operations:
     - add()
     - neg()
@@ -491,7 +491,8 @@ public:
      * @param[in,out] source The tensor to create alias of.
      * @return A new tensor that is an alias of the tensor.
      */
-    static Tensor<T> alias(const Tensor<T>& source) {
+    static Tensor<T> alias(const Tensor<T>& source) 
+    {
         Tensor<T> t(source);    // copies all shared_ptrs including grad_storage_
         t.grad_fn_ = nullptr;   // strip: alias is not a graph operation result
         return t;
@@ -775,7 +776,8 @@ public:
      * @param[in] shape The shape of the weight tensor (rank >= 1).
      * @return A pair {fan_in, fan_out}.
      */
-    static std::pair<int64_t, int64_t> compute_fans(const std::vector<int64_t>& shape) {
+    static std::pair<int64_t, int64_t> compute_fans(const std::vector<int64_t>& shape) 
+    {
         if (shape.size() < 2) {
             return {shape[0], shape[0]};
         }
@@ -914,67 +916,179 @@ public:
         return Tensor<T>::from_operation_result(shape, std::move(storage), requires_grad, nullptr);
     }
 
+    /**
+     * Uniform initialization: U[low, high).
+     *
+     * @param[in] shape The shape of the tensor.
+     * @param[in] low   Inclusive lower bound.
+     * @param[in] high  Exclusive upper bound.
+     * @param[in] requires_grad Whether the tensor requires gradients (default: true).
+     * @param[in] seed  Optional RNG seed.
+     * @return A new tensor filled with uniform samples.
+     * @throws std::invalid_argument if low >= high.
+     */
+    static Tensor<T> uniform(
+        const std::vector<int64_t>& shape,
+        T low,
+        T high,
+        bool requires_grad = true,
+        std::optional<uint64_t> seed = std::nullopt
+    ) {
+        if (!(low < high))
+            throw std::invalid_argument("uniform: low must be < high");
+        const int64_t n = compute_numel(shape);
+        std::vector<T> storage(static_cast<size_t>(n));
+        std::mt19937_64 rng{seed.has_value() ? *seed : std::random_device{}()};
+        std::uniform_real_distribution<double> dist(
+            static_cast<double>(low), static_cast<double>(high));
+        for (auto& v : storage)
+            v = static_cast<T>(dist(rng));
+        return Tensor<T>::from_operation_result(shape, std::move(storage), requires_grad, nullptr);
+    }
+
 
     // ----- accessors -----
 
+    /**
+     * Number of dimensions (size of `shape_`). Same as `ndim()`.
+     *
+     * @return Rank as a signed integer.
+     */
     int64_t rank() const {
         return static_cast<int64_t>(shape_.size());
     }
 
+    /**
+     * Number of logical elements, i.e. the product of `shape_`.
+     * Independent of strides, offset, and backing-buffer size.
+     *
+     * @return Element count (0 for an empty dimension).
+     */
     int64_t numel() const {
         return compute_numel(shape_);
     }
 
+    /**
+     * Logical shape of the tensor.
+     *
+     * @return Reference to the shape vector (do not mutate).
+     */
     const std::vector<int64_t>& shape() const {
         return shape_;
     }
 
+    /**
+     * Number of dimensions. Alias of `rank()`.
+     *
+     * @return Rank as a signed integer.
+     */
     int64_t ndim() const {
         return shape_.size();
     }
 
+    /**
+     * Per-dimension step in the backing buffer, in elements (not bytes).
+     * Logical index (i0, i1, ...) maps to `offset_ + i0*s0 + i1*s1 + ...`.
+     *
+     * @return Reference to the stride vector (do not mutate).
+     */
     const std::vector<int64_t>& strides() const {
         return strides_;
     }
 
+    /**
+     * Starting index into the backing buffer for this tensor (0 for owners).
+     *
+     * @return Element offset (not a byte offset).
+     */
     int64_t offset() const {
         return offset_;
     }
 
+    /**
+     * Runtime dtype tag inferred from the template parameter T.
+     *
+     * @return One of Float32, Float64, Int32, Int64.
+     */
     Dtype dtype() const {
         return dtype_;
     }
 
+    /**
+     * Whether this tensor participates in autograd.
+     * Always false for integer storage types.
+     *
+     * @return True if gradients should be tracked.
+     */
     bool requires_grad() const {
         return requires_grad_;
     }
 
+    /**
+     * Whether this tensor is a view of another tensor (`base_ptr_ != nullptr`).
+     * Views share `data_ptr_` with the base; they do not own a separate buffer.
+     *
+     * @return True for views created by shape ops.
+     */
     bool is_view() const {
         return base_ptr_ != nullptr;
     }
 
+    /**
+     * Whether strides match row-major contiguous strides for `shape_`.
+     * Does not require `offset_ == 0`; a contiguous slice can still have a
+     * non-zero offset.
+     *
+     * @return True if a dense `data()[i]` loop would match logical order
+     *         only when `offset_ == 0` as well.
+     */
     bool is_contiguous() const {
         return strides_ == compute_contiguous_strides(shape_);
     }
 
+    /**
+     * Backward node that produced this tensor, or nullptr for a leaf.
+     *
+     * @return Shared pointer to the autograd node (may be empty).
+     */
     const std::shared_ptr<autograd::Node<T>>& grad_fn() const {
         return grad_fn_;
     }
 
-    // Storage accessors are provided as const/non-const references
+    /**
+     * Entire backing storage, not just this tensor's logical elements.
+     * For a view the vector may be larger than `numel()`; use `offset()` and
+     * `strides()` (or `operator[]`) to index logically. Dense kernels that
+     * read `data()[i]` for `i in 0..numel()` assume a contiguous tensor with
+     * `offset() == 0` — call `contiguous()` first if needed.
+     *
+     * @return Const reference to the shared storage vector.
+     */
     const std::vector<T>& data() const {
         return *data_ptr_;
     }
 
+    /**
+     * Mutable backing storage. Same caveats as the const overload: this is
+     * the full buffer, and in-place writes are not version-checked.
+     *
+     * @return Mutable reference to the shared storage vector.
+     */
     std::vector<T>& data() {
         return *data_ptr_;
     }
 
-    // Multi-dimensional element access via chained operator[].
-    // Usage: tensor[i][j][k]
-    // The Tensor acts as the first-level accessor; each operator[] returns a
-    // TensorAccessor that consumes one further dimension.
-    TensorAccessor<T> operator[](int64_t idx) {
+    /**
+     * Multi-dimensional element access via chained `operator[]`.
+     * Usage: `tensor[i][j][k]`. Each call consumes one dimension using
+     * `offset_` and `strides_`, so views (transpose, broadcast) index correctly.
+     *
+     * @param[in] idx Index along the leading remaining dimension.
+     * @return Accessor for the next dimension, or a scalar proxy at rank 0.
+     * @throws std::out_of_range if `idx` is out of bounds.
+     */
+    TensorAccessor<T> operator[](int64_t idx) 
+    {
         return TensorAccessor<T>(
             data_ptr_->data() + offset_,
             shape_.data(),
@@ -983,7 +1097,16 @@ public:
         )[idx];
     }
 
-    TensorAccessor<const T> operator[](int64_t idx) const {
+    /**
+     * Const overload of chained `operator[]`. Assignment through the
+     * returned accessor is disabled.
+     *
+     * @param[in] idx Index along the leading remaining dimension.
+     * @return Read-only accessor for the next dimension.
+     * @throws std::out_of_range if `idx` is out of bounds.
+     */
+    TensorAccessor<const T> operator[](int64_t idx) const 
+    {
         return TensorAccessor<const T>(
             data_ptr_->data() + offset_,
             shape_.data(),
@@ -994,88 +1117,433 @@ public:
 
     // ----- casting methods -----
 
-    // Cast all elements to a different scalar type.
-    // The returned tensor is always a non-grad leaf (cross-type autograd not yet supported).
+    /**
+     * Cast every element to scalar type U and return a new packed tensor.
+     * Non-contiguous sources are packed first (logical order). Float→float
+     * keeps `requires_grad` and attaches `CastBackward` (backward recasts
+     * the gradient to the input dtype). Integer results never require grad.
+     *
+     * @return New `Tensor<U>` with the same shape.
+     */
     template <typename U>
     Tensor<U> to() const;
 
+    /**
+     * Convenience wrapper for `to<float>()`.
+     *
+     * @return New Float32 tensor (tracks grad if this tensor does).
+     */
+    Tensor<float> float32() const;
+
+    /**
+     * Convenience wrapper for `to<double>()`.
+     *
+     * @return New Float64 tensor (tracks grad if this tensor does).
+     */
+    Tensor<double> float64() const;
+
+    /**
+     * Convenience wrapper for `to<int32_t>()`. Integer results never require grad.
+     *
+     * @return New Int32 tensor (non-grad leaf).
+     */
+    Tensor<int32_t> int32() const;
+
+    /**
+     * Convenience wrapper for `to<int64_t>()`. Integer results never require grad.
+     *
+     * @return New Int64 tensor (non-grad leaf).
+     */
+    Tensor<int64_t> int64() const;
+
     // ----- shape operations -----
 
-    // reshape
+    /**
+     * Reinterpret the same storage as `shape` (zero-copy view).
+     * `numel` must match and the tensor must be contiguous.
+     *
+     * @param[in] shape Target shape; product of dims must equal `numel()`.
+     * @return View with contiguous strides for `shape`.
+     * @throws std::invalid_argument if the tensor is a scalar, non-contiguous,
+     *         or `numel` would change.
+     */
     Tensor<T> reshape(const std::vector<int64_t>& shape) const;
 
-    // transpose
+    /**
+     * Swap two dimensions by swapping their shape entries and strides (zero-copy).
+     *
+     * @param[in] dim0 First dimension (negative indices allowed).
+     * @param[in] dim1 Second dimension (negative indices allowed).
+     * @return View with the two axes exchanged.
+     * @throws std::invalid_argument if the tensor is a scalar.
+     * @throws std::out_of_range if a dimension is out of bounds.
+     */
     Tensor<T> transpose(int64_t dim0, int64_t dim1) const;
 
-    // transpose matrix
+    /**
+     * Swap the two axes of a rank-2 tensor. Equivalent to `transpose(0, 1)`.
+     *
+     * @return View with shape `[n, m]` if this tensor is `[m, n]`.
+     * @throws std::invalid_argument if rank is not 2.
+     */
     Tensor<T> transpose() const;
 
-    // broadcast_to: returns a zero-copy stride-0 view expanded to target_shape
+    /**
+     * Expand this tensor to `target_shape` by setting stride 0 on broadcast axes.
+     * Zero-copy: elements are not repeated in memory.
+     *
+     * @param[in] target_shape Compatible shape (NumPy right-alignment rules).
+     * @return View with stride 0 on expanded axes.
+     * @throws std::invalid_argument if the shapes are not broadcast-compatible.
+     */
     Tensor<T> broadcast_to(const std::vector<int64_t>& target_shape) const;
 
-    // view: shares storage (requires contiguous), identical to reshape in this codebase
+    /**
+     * Share storage under a new contiguous shape. Identical to `reshape` here.
+     *
+     * @param[in] shape Target shape; product of dims must equal `numel()`.
+     * @return View with contiguous strides for `shape`.
+     * @throws std::invalid_argument if the tensor is a scalar, non-contiguous,
+     *         or `numel` would change.
+     */
     Tensor<T> view(const std::vector<int64_t>& shape) const;
 
-    // flatten dims [start_dim, end_dim] inclusive into one dim (requires contiguous)
+    /**
+     * Collapse dimensions `[start_dim, end_dim]` (inclusive) into one.
+     * Requires a contiguous tensor.
+     *
+     * @param[in] start_dim First collapsed axis (default 0; negative allowed).
+     * @param[in] end_dim Last collapsed axis (default -1; negative allowed).
+     * @return View with those axes merged.
+     * @throws std::invalid_argument if the tensor is a scalar, non-contiguous,
+     *         or `start_dim > end_dim` after normalization.
+     */
     Tensor<T> flatten(int64_t start_dim = 0, int64_t end_dim = -1) const;
 
-    // squeeze: remove all size-1 dimensions
+    /**
+     * Remove every size-1 dimension. Strides of remaining axes are kept, so
+     * this is valid on non-contiguous tensors.
+     *
+     * @return View with all size-1 axes dropped (scalar if every dim was 1).
+     */
     Tensor<T> squeeze() const;
 
-    // squeeze: remove the size-1 dimension at dim (no-op if size != 1)
+    /**
+     * Remove the size-1 dimension at `dim`. No-op (still a view) if that
+     * dimension is not size 1.
+     *
+     * @param[in] dim Axis to drop (negative indices allowed).
+     * @return View with that axis removed, or an unchanged view.
+     * @throws std::out_of_range if `dim` is out of bounds.
+     */
     Tensor<T> squeeze(int64_t dim) const;
 
-    // unsqueeze: insert a new size-1 dimension at dim; valid range [-rank-1, rank]
+    /**
+     * Insert a size-1 dimension at `dim`. Valid range is `[-rank-1, rank]`.
+     *
+     * @param[in] dim Insertion index (negative indices allowed).
+     * @return View with a new size-1 axis.
+     * @throws std::out_of_range if `dim` is outside `[-rank-1, rank]`.
+     */
     Tensor<T> unsqueeze(int64_t dim) const;
 
+    /**
+     * Return a tensor whose logical order is packed into a dense row-major buffer.
+     * If this tensor is already contiguous with `offset() == 0`, returns `*this`
+     * (same `data_ptr_`, no extra graph node). Otherwise allocates `numel()`
+     * elements and copies with the stride formula.
+     *
+     * @return Contiguous tensor with the same shape and logical values.
+     */
+    Tensor<T> contiguous() const;
+
+    /**
+     * View of a slice along `dim`: indices `[start, start+length)`.
+     *
+     * @param[in] dim Axis to slice (negative indices allowed).
+     * @param[in] start First index along `dim`.
+     * @param[in] length Number of elements to keep.
+     * @return View sharing storage with `*this`.
+     * @throws std::invalid_argument if the tensor is scalar or the range is invalid.
+     */
+    Tensor<T> narrow(int64_t dim, int64_t start, int64_t length) const;
+
     // ----- math operations -----
+
+    /**
+     * Element-wise addition. Inputs must have the same shape (no broadcasting
+     * inside the kernel; call `broadcast_to` first). Allocates a new buffer.
+     *
+     * @param[in] other Right-hand operand.
+     * @return New tensor `*this + other`.
+     * @throws std::invalid_argument on shape mismatch.
+     */
     Tensor<T> add(const Tensor<T>& other) const;
+
+    /**
+     * Element-wise negation. Allocates a new buffer.
+     *
+     * @return New tensor `-(*this)`.
+     */
     Tensor<T> neg() const;
+
+    /**
+     * Element-wise subtraction. Same-shape inputs; new buffer.
+     *
+     * @param[in] other Right-hand operand.
+     * @return New tensor `*this - other`.
+     * @throws std::invalid_argument on shape mismatch.
+     */
     Tensor<T> subtract(const Tensor<T>& other) const;
+
+    /**
+     * Element-wise multiplication. Same-shape inputs; new buffer.
+     *
+     * @param[in] other Right-hand operand.
+     * @return New tensor `*this * other`.
+     * @throws std::invalid_argument on shape mismatch.
+     */
     Tensor<T> multiply(const Tensor<T>& other) const;
+
+    /**
+     * Element-wise division. Same-shape inputs; new buffer.
+     *
+     * @param[in] other Right-hand operand.
+     * @return New tensor `*this / other`.
+     * @throws std::invalid_argument on shape mismatch.
+     * @throws std::runtime_error on division by zero.
+     */
     Tensor<T> divide(const Tensor<T>& other) const;
+
+    /**
+     * Element-wise power with a scalar exponent. New buffer.
+     *
+     * @param[in] exponent Scalar exponent.
+     * @return New tensor `(*this) ** exponent`.
+     */
     Tensor<T> power(const T exponent) const;
+
+    /**
+     * Element-wise absolute value. New buffer.
+     *
+     * @return New tensor `| *this |`.
+     */
     Tensor<T> abs() const;
+
+    /**
+     * Element-wise exponential. New buffer.
+     *
+     * @return New tensor `exp(*this)`.
+     */
     Tensor<T> exp() const;
+
+    /**
+     * Element-wise natural logarithm. New buffer.
+     *
+     * @return New tensor `log(*this)`.
+     */
     Tensor<T> log() const;
+
+    /**
+     * Element-wise square root. New buffer.
+     *
+     * @return New tensor `sqrt(*this)`.
+     */
+    Tensor<T> sqrt() const;
+
+    /**
+     * Element-wise sine. New buffer.
+     *
+     * @return New tensor `sin(*this)`.
+     */
     Tensor<T> sin() const;
+
+    /**
+     * Element-wise cosine. New buffer.
+     *
+     * @return New tensor `cos(*this)`.
+     */
     Tensor<T> cos() const;
+
+    /**
+     * Element-wise tangent. New buffer.
+     *
+     * @return New tensor `tan(*this)`.
+     */
     Tensor<T> tan() const;
+
+    /**
+     * Element-wise hyperbolic sine. New buffer.
+     *
+     * @return New tensor `sinh(*this)`.
+     */
     Tensor<T> sinh() const;
+
+    /**
+     * Element-wise hyperbolic cosine. New buffer.
+     *
+     * @return New tensor `cosh(*this)`.
+     */
     Tensor<T> cosh() const;
+
+    /**
+     * Element-wise hyperbolic tangent. New buffer.
+     *
+     * @return New tensor `tanh(*this)`.
+     */
     Tensor<T> tanh() const;
+
+    /**
+     * Element-wise sigmoid, `1 / (1 + exp(-x))`. New buffer.
+     *
+     * @return New tensor in `(0, 1)`.
+     */
     Tensor<T> sigmoid() const;
+
+    /**
+     * Element-wise ReLU, `max(0, x)`. New buffer.
+     *
+     * @return New tensor with negatives zeroed.
+     */
     Tensor<T> relu() const;
+
+    /**
+     * Element-wise SiLU (swish), `x * sigmoid(x)`. New buffer.
+     *
+     * @return New tensor.
+     */
     Tensor<T> silu() const;
+
+    /**
+     * Element-wise GELU (tanh approximation). New buffer.
+     *
+     * @return New tensor.
+     */
     Tensor<T> gelu() const;
 
     // ----- reduction operations -----
+
+    /**
+     * Sum of every element, as a scalar tensor of shape `{}`.
+     *
+     * @return Scalar tensor.
+     * @throws std::invalid_argument if the tensor is empty.
+     */
     Tensor<T> sum() const;
+
+    /**
+     * Sum along one axis; that axis is removed from the output shape.
+     *
+     * @param[in] dim Axis to reduce (negative indices allowed).
+     * @return Tensor with `dim` dropped.
+     * @throws std::invalid_argument if the tensor is a scalar.
+     * @throws std::out_of_range if `dim` is out of bounds.
+     */
     Tensor<T> sum(int64_t dim) const;
+
+    /**
+     * Mean of every element, as a scalar tensor of shape `{}`.
+     *
+     * @return Scalar tensor.
+     * @throws std::invalid_argument if the tensor is empty.
+     */
     Tensor<T> mean() const;
+
+    /**
+     * Mean along one axis; that axis is removed from the output shape.
+     *
+     * @param[in] dim Axis to reduce (negative indices allowed).
+     * @return Tensor with `dim` dropped.
+     * @throws std::invalid_argument if the tensor is a scalar.
+     * @throws std::out_of_range if `dim` is out of bounds.
+     */
     Tensor<T> mean(int64_t dim) const;
+
+    /**
+     * Maximum element as a scalar tensor of shape `{}`. Ties keep the first index.
+     *
+     * @return Scalar tensor.
+     * @throws std::invalid_argument if the tensor is empty.
+     */
     Tensor<T> max() const;
+
+    /**
+     * Minimum element as a scalar tensor of shape `{}`. Ties keep the first index.
+     *
+     * @return Scalar tensor.
+     * @throws std::invalid_argument if the tensor is empty.
+     */
     Tensor<T> min() const;
+
+    /**
+     * Softmax along `dim` (max-subtraction for stability). Output shape matches input.
+     *
+     * @param[in] dim Axis to normalize (negative indices allowed).
+     * @return Tensor of the same shape; each slice along `dim` sums to 1.
+     * @throws std::invalid_argument if the tensor is a scalar.
+     * @throws std::out_of_range if `dim` is out of bounds.
+     */
     Tensor<T> softmax(int64_t dim) const;
 
     // ----- linalg operations -----
+
+    /**
+     * Inner product of two 1-D tensors of equal length. Result shape is `{}`.
+     *
+     * @param[in] other Other vector.
+     * @return Scalar tensor.
+     * @throws std::invalid_argument if either input is not 1-D or lengths differ.
+     */
     Tensor<T> dot(const Tensor<T>& other) const;
+
+    /**
+     * Matrix product of two 2-D tensors. Reads through strides, so transposed
+     * inputs are correct without calling `contiguous()`.
+     *
+     * @param[in] other Right-hand matrix of shape `[K, N]` if `*this` is `[M, K]`.
+     * @return New contiguous tensor of shape `[M, N]`.
+     * @throws std::invalid_argument if ranks are not 2 or inner dims mismatch.
+     */
     Tensor<T> matmul(const Tensor<T>& other) const;
 
     // ----- grad / backward -----
+
+    /**
+     * True if this tensor was not produced by an op (`grad_fn_ == nullptr`).
+     * User-created tensors are leaves; differentiable `to()` outputs are not.
+     *
+     * @return True for leaves.
+     */
     bool is_leaf() const { return grad_fn_ == nullptr; }
 
-    // Returns the accumulated gradient tensor, or nullptr if backward has not
-    // been called yet (or this tensor does not require grad).
+    /**
+     * Accumulated gradient of a leaf, or nullptr if backward has not run
+     * (or this tensor does not require grad).
+     *
+     * @return Pointer into `GradStorage`, or nullptr.
+     */
     const Tensor<T>* grad() const;
 
-    // Accumulate `grad` into this tensor's gradient buffer (engine-internal).
+    /**
+     * Add `grad` into this leaf's gradient buffer. Engine-internal.
+     *
+     * @param[in] grad Incoming gradient; shape must match this tensor.
+     */
     void accumulate_grad(const Tensor<T>& grad);
 
-    // Clear the gradient buffer. Call before each backward pass.
+    /**
+     * Drop the gradient tensor but keep `GradStorage` so later aliases still
+     * share it. Call before each backward pass.
+     */
     void zero_grad() const;
 
-    // ----- backward -----
+    /**
+     * Run reverse-mode autodiff from this scalar output.
+     * Accumulates into `.grad()` of every reachable leaf that requires grad.
+     *
+     * @return `*this` (unchanged).
+     * @throws std::invalid_argument if `numel() != 1` or `grad_fn` is null.
+     */
     Tensor<T> backward() const;
 };
 

@@ -11,11 +11,43 @@ namespace tensor {
 template <typename T>
 template <typename U>
 Tensor<U> Tensor<T>::to() const {
-    const auto& src = data();
-    std::vector<U> new_data(src.size());
+    const Tensor<T> src = this->contiguous();
+    const auto& buf = src.data();
+    std::vector<U> new_data(static_cast<size_t>(src.numel()));
     for (size_t i = 0; i < new_data.size(); ++i)
-        new_data[i] = static_cast<U>(src[i]);
-    return Tensor<U>::from_operation_result(shape_, std::move(new_data), false, nullptr);
+        new_data[i] = static_cast<U>(buf[i]);
+
+    const bool out_is_float = std::is_same<U, float>::value
+                           || std::is_same<U, double>::value;
+    const bool requires_grad = autograd::is_grad_enabled()
+                            && src.requires_grad()
+                            && out_is_float;
+    std::shared_ptr<autograd::Node<U>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::CastBackward<U, T>>(src);
+
+    return Tensor<U>::from_operation_result(
+        src.shape(), std::move(new_data), requires_grad, std::move(grad_fn));
+}
+
+template <typename T>
+Tensor<float> Tensor<T>::float32() const {
+    return to<float>();
+}
+
+template <typename T>
+Tensor<double> Tensor<T>::float64() const {
+    return to<double>();
+}
+
+template <typename T>
+Tensor<int32_t> Tensor<T>::int32() const {
+    return to<int32_t>();
+}
+
+template <typename T>
+Tensor<int64_t> Tensor<T>::int64() const {
+    return to<int64_t>();
 }
 
 // ----- shape operations -----
@@ -71,6 +103,16 @@ Tensor<T> Tensor<T>::unsqueeze(int64_t dim) const {
     return ops::unsqueeze<T>(*this, dim);
 }
 
+template <typename T>
+Tensor<T> Tensor<T>::contiguous() const {
+    return ops::contiguous<T>(*this);
+}
+
+template <typename T>
+Tensor<T> Tensor<T>::narrow(int64_t dim, int64_t start, int64_t length) const {
+    return ops::narrow<T>(*this, dim, start, length);
+}
+
 // ----- elementwise operations -----
 
 template <typename T>
@@ -116,6 +158,11 @@ Tensor<T> Tensor<T>::exp() const {
 template <typename T>
 Tensor<T> Tensor<T>::log() const {
     return ops::log<T>(*this);
+}
+
+template <typename T>
+Tensor<T> Tensor<T>::sqrt() const {
+    return ops::sqrt<T>(*this);
 }
 
 template <typename T>
@@ -232,7 +279,8 @@ const Tensor<T>* Tensor<T>::grad() const {
 template <typename T>
 void Tensor<T>::accumulate_grad(const Tensor<T>& g) {
     if (!grad_storage_) return;
-    if (!grad_storage_->tensor) {
+    if (!grad_storage_->tensor) 
+    {
         grad_storage_->tensor = std::make_shared<Tensor<T>>(g.shape(), g.data(), false);
     } else {
         auto& dst = grad_storage_->tensor->data();

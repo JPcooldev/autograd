@@ -229,3 +229,71 @@ TEST_CASE("backward: loss = sum(A @ B)  →  dA = ones_grad @ B^T, dB = A^T @ on
     CHECK(B.grad()->data()[2] == doctest::Approx(6.f));
     CHECK(B.grad()->data()[3] == doctest::Approx(6.f));
 }
+
+// ─── backward: casting ────────────────────────────────────────────────────────
+
+TEST_CASE("backward: float -> double -> sum  writes float leaf grad") {
+    tensor::Tensor<float> x({3}, std::vector<float>{1.f, 2.f, 3.f}, true);
+    x.to<double>().sum().backward();
+
+    REQUIRE(x.grad() != nullptr);
+    for (size_t i = 0; i < 3; ++i)
+        CHECK(x.grad()->data()[i] == doctest::Approx(1.f));
+}
+
+TEST_CASE("backward: double -> float -> sum  writes double leaf grad") {
+    tensor::Tensor<double> x({2}, std::vector<double>{1.0, 2.0}, true);
+    x.float32().sum().backward();
+
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(1.0));
+    CHECK(x.grad()->data()[1] == doctest::Approx(1.0));
+}
+
+TEST_CASE("backward: same-dtype to<float>() stays on the graph") {
+    tensor::Tensor<float> x({2}, std::vector<float>{4.f, 5.f}, true);
+    x.to<float>().sum().backward();
+
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(1.f));
+    CHECK(x.grad()->data()[1] == doctest::Approx(1.f));
+}
+
+TEST_CASE("backward: float -> double -> float sandwich") {
+    tensor::Tensor<float> x({2}, std::vector<float>{1.f, 3.f}, true);
+    x.to<double>().to<float>().sum().backward();
+
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(1.f));
+    CHECK(x.grad()->data()[1] == doctest::Approx(1.f));
+}
+
+TEST_CASE("backward: cast after a differentiable op") {
+    tensor::Tensor<float> x({2}, std::vector<float>{2.f, 3.f}, true);
+    x.add(x).to<double>().sum().backward();
+
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(2.f));
+    CHECK(x.grad()->data()[1] == doctest::Approx(2.f));
+}
+
+TEST_CASE("backward: mixed-dtype add float + double") {
+    tensor::Tensor<float> a({2}, std::vector<float>{1.f, 2.f}, true);
+    tensor::Tensor<double> b({2}, std::vector<double>{3.0, 4.0}, true);
+    ops::add(a, b).sum().backward();
+
+    REQUIRE(a.grad() != nullptr);
+    REQUIRE(b.grad() != nullptr);
+    CHECK(a.grad()->data()[0] == doctest::Approx(1.f));
+    CHECK(a.grad()->data()[1] == doctest::Approx(1.f));
+    CHECK(b.grad()->data()[0] == doctest::Approx(1.0));
+    CHECK(b.grad()->data()[1] == doctest::Approx(1.0));
+}
+
+TEST_CASE("to() under NoGradContext does not attach grad_fn") {
+    tensor::Tensor<float> x({2}, std::vector<float>{1.f, 2.f}, true);
+    autograd::NoGradContext guard;
+    const auto y = x.to<double>();
+    CHECK_FALSE(y.requires_grad());
+    CHECK(y.grad_fn().get() == nullptr);
+}

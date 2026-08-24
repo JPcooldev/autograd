@@ -34,7 +34,7 @@ fi
 
 mkdir -p "$BUILD_DIR"
 
-g++-15 -std=c++17 -Wall -Wextra -pedantic \
+g++-14 -std=c++17 -Wall -Wextra -pedantic \
     -I "$REPO_ROOT/src" \
     "$REPO_ROOT/tests/test_main.cpp" \
     "${TEST_FILES[@]}" \

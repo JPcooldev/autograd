@@ -73,39 +73,22 @@ public:
             const double one_minus_beta1_pow_step = 1.0 - std::pow(beta1, static_cast<double>(state.step));
             const double one_minus_beta2_pow_step = 1.0 - std::pow(beta2, static_cast<double>(state.step));
 
-            if (weight_decay > 0.0) {
-                for (size_t i = 0; i < n; ++i) {
-                    // g_eff = g_t + wd * theta_{t-1}
-                    const double g = static_cast<double>(grad[i]) + weight_decay * static_cast<double>(data[i]);
+            for (size_t i = 0; i < n; ++i) 
+            {
+                // g_eff = g_t + wd * theta_{t-1}  (wd = 0 is a no-op FMA)
+                const double g = static_cast<double>(grad[i])
+                               + weight_decay * static_cast<double>(data[i]);
 
-                    // m_t = beta1 * m_{t-1} + (1 - beta1) * g_eff
-                    state.m[i] = static_cast<T>(beta1 * static_cast<double>(state.m[i]) + one_minus_beta1 * g);
-                    // v_t = beta2 * v_{t-1} + (1 - beta2) * g_eff^2
-                    state.v[i] = static_cast<T>(beta2 * static_cast<double>(state.v[i]) + one_minus_beta2 * g * g);
+                // m_t = beta1 * m_{t-1} + (1 - beta1) * g_eff
+                state.m[i] = static_cast<T>(beta1 * static_cast<double>(state.m[i]) + one_minus_beta1 * g);
+                // v_t = beta2 * v_{t-1} + (1 - beta2) * g_eff^2
+                state.v[i] = static_cast<T>(beta2 * static_cast<double>(state.v[i]) + one_minus_beta2 * g * g);
 
-                    // m_hat = m_t / (1 - beta1^t),  v_hat = v_t / (1 - beta2^t)
-                    const double m_hat = static_cast<double>(state.m[i]) / one_minus_beta1_pow_step;
-                    const double v_hat = static_cast<double>(state.v[i]) / one_minus_beta2_pow_step;
-                    // theta_t = theta_{t-1} - lr * m_hat / (sqrt(v_hat) + eps)
-                    data[i] -= static_cast<T>(learning_rate * m_hat / (std::sqrt(v_hat) + eps));
-                }
-            } else {
-                for (size_t i = 0; i < n; ++i) {
-                    const double g = static_cast<double>(grad[i]);
-
-                    // m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
-                    state.m[i] = static_cast<T>(beta1 * static_cast<double>(state.m[i]) + one_minus_beta1 * g);
-                    // v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2
-                    state.v[i] = static_cast<T>(beta2 * static_cast<double>(state.v[i]) + one_minus_beta2 * g * g);
-
-                    // m_hat = m_t / (1 - beta1^t),  v_hat = v_t / (1 - beta2^t)
-                    const double m_hat = static_cast<double>(state.m[i]) / one_minus_beta1_pow_step;
-                    const double v_hat = static_cast<double>(state.v[i]) / one_minus_beta2_pow_step;
-                    // theta_t = theta_{t-1} - learning_rate * m_hat / (sqrt(v_hat) + eps)
-                    data[i] -= static_cast<T>(
-                        learning_rate * (m_hat / (std::sqrt(v_hat) + eps))
-                    );
-                }
+                // m_hat = m_t / (1 - beta1^t),  v_hat = v_t / (1 - beta2^t)
+                const double m_hat = static_cast<double>(state.m[i]) / one_minus_beta1_pow_step;
+                const double v_hat = static_cast<double>(state.v[i]) / one_minus_beta2_pow_step;
+                // theta_t = theta_{t-1} - lr * m_hat / (sqrt(v_hat) + eps)
+                data[i] -= static_cast<T>(learning_rate * m_hat / (std::sqrt(v_hat) + eps));
             }
         }
     }

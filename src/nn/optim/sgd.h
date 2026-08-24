@@ -17,7 +17,7 @@ public:
 
     ~SGD() = default;
 
-    void step() override 
+    void step() override
     {
         const double learning_rate = this->learning_rate_;
         const double weight_decay = this->weight_decay_;
@@ -34,24 +34,13 @@ public:
             auto& data = param->data();
             const auto& grad = grad_tensor->data();
             const size_t n = data.size();
-            
-            if (weight_decay > 0.0) 
-            {
-                for (size_t i = 0; i < n; ++i) 
-                {
-                    // theta_t = theta_{t-1} - learning_rate(gradient + weight_decay * theta_{t-1})
-                    data[i] -= static_cast<T>(learning_rate * (static_cast<double>(grad[i]) + weight_decay * static_cast<double>(data[i])));
-                }
-            } else {
-                for (size_t i = 0; i < n; ++i)
-                    // theta_t = theta_{t-1} - learning_rate * gradient
-                    data[i] -= static_cast<T>(learning_rate * static_cast<double>(grad[i]));
-            }
+
+            for (size_t i = 0; i < n; ++i)
+                // theta_t = theta_{t-1} - lr * (g_t + wd * theta_{t-1})
+                data[i] -= static_cast<T>(learning_rate * (
+                    static_cast<double>(grad[i]) + weight_decay * static_cast<double>(data[i])));
         }
     }
-
-
-
 };
 
 } // namespace optim

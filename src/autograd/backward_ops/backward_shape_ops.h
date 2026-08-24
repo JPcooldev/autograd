@@ -1,8 +1,9 @@
 #pragma once
 
-#include <vector>
 #include <memory>
+#include <vector>
 
+#include "../engine.h"
 #include "../node.h"
 
 namespace autograd {
@@ -159,6 +160,19 @@ public:
     }
 };
 
+// Layout-only op: values and logical shape are unchanged. The incoming
+// gradient is already in logical (row-major) order, so backward is identity.
+template <typename T>
+class ContiguousBackward : public Node<T> {
+public:
+    explicit ContiguousBackward(const Tensor<T>& x) : Node<T>(x) {}
+
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
+    {
+        return {propagated_grad};
+    }
+};
+
 template <typename T>
 class BroadcastToBackward : public Node<T> {
     // We only need the original shape for the backward sum reduction.
@@ -176,6 +190,143 @@ public:
         // The backward undoes that by summing all gradient contributions
         // that pointed at the same original element back together.
         return {sum_to(propagated_grad, original_shape_)};
+    }
+};
+
+template <typename T>
+class NarrowBackward : public Node<T> {
+    int64_t dim_;
+    int64_t start_;
+    std::vector<int64_t> input_shape_;
+public:
+    NarrowBackward(const Tensor<T>& x, int64_t dim, int64_t start)
+        : Node<T>(x), dim_(dim), start_(start), input_shape_(x.shape())
+    {}
+
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
+    {
+        std::vector<T> storage(static_cast<size_t>(
+            Tensor<T>::compute_numel(input_shape_)), T{0});
+        const auto g = propagated_grad.contiguous();
+        const auto& gd = g.data();
+        const int64_t rank = static_cast<int64_t>(input_shape_.size());
+        const auto in_strides = Tensor<T>::compute_contiguous_strides(input_shape_);
+        const auto g_shape = g.shape();
+        const auto g_strides = Tensor<T>::compute_contiguous_strides(g_shape);
+        for (int64_t f = 0; f < g.numel(); ++f) {
+            int64_t rem = f;
+            int64_t in_f = 0;
+            for (int64_t d = 0; d < rank; ++d) {
+                int64_t idx = rem / g_strides[static_cast<size_t>(d)];
+                rem %= g_strides[static_cast<size_t>(d)];
+                if (d == dim_) idx += start_;
+                in_f += idx * in_strides[static_cast<size_t>(d)];
+            }
+            storage[static_cast<size_t>(in_f)] = gd[static_cast<size_t>(f)];
+        }
+        return {Tensor<T>::from_operation_result(input_shape_, std::move(storage), false, nullptr)};
+    }
+};
+
+template <typename T>
+class CatBackward : public Node<T> {
+    int64_t dim_;
+    std::vector<int64_t> sizes_;
+    std::vector<std::vector<int64_t>> in_shapes_;
+public:
+    CatBackward(const std::vector<Tensor<T>>& inputs, int64_t dim)
+        : dim_(dim)
+    {
+        this->saved_tensors.reserve(inputs.size());
+        this->next_edges.reserve(inputs.size());
+        sizes_.reserve(inputs.size());
+        in_shapes_.reserve(inputs.size());
+        for (const auto& t : inputs) {
+            this->saved_tensors.emplace_back(Tensor<T>::alias(t));
+            this->next_edges.emplace_back(Node<T>::get_next_edge(t));
+            sizes_.push_back(t.shape()[static_cast<size_t>(dim)]);
+            in_shapes_.push_back(t.shape());
+        }
+    }
+
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
+    {
+        const auto g = propagated_grad.contiguous();
+        const auto& gd = g.data();
+        const auto g_shape = g.shape();
+        const int64_t rank = g.rank();
+        const auto g_strides = Tensor<T>::compute_contiguous_strides(g_shape);
+
+        std::vector<Tensor<T>> grads;
+        grads.reserve(sizes_.size());
+        int64_t dim_offset = 0;
+        for (size_t i = 0; i < sizes_.size(); ++i) {
+            const auto& ishape = in_shapes_[i];
+            const int64_t n = Tensor<T>::compute_numel(ishape);
+            std::vector<T> storage(static_cast<size_t>(n));
+            const auto in_strides = Tensor<T>::compute_contiguous_strides(ishape);
+            for (int64_t f = 0; f < n; ++f) {
+                int64_t remaining = f;
+                int64_t g_f = 0;
+                for (int64_t d = 0; d < rank; ++d) {
+                    int64_t idx = remaining / in_strides[static_cast<size_t>(d)];
+                    remaining %= in_strides[static_cast<size_t>(d)];
+                    if (d == dim_) idx += dim_offset;
+                    g_f += idx * g_strides[static_cast<size_t>(d)];
+                }
+                storage[static_cast<size_t>(f)] = gd[static_cast<size_t>(g_f)];
+            }
+            grads.push_back(Tensor<T>::from_operation_result(
+                ishape, std::move(storage), false, nullptr));
+            dim_offset += sizes_[i];
+        }
+        return grads;
+    }
+};
+
+// Backward of y = cast_{InT → OutT}(x): recast the incoming gradient to InT.
+// The Jacobian is the identity, so apply() is a dtype conversion of `propagated_grad`.
+//
+// Same-type (`CastBackward<T, T>`): a normal Node<T> edge; the engine continues.
+// Cross-type: Node<OutT> cannot hold Node<InT> edges, so apply() either
+// accumulate_grad()s into a leaf or run_backward()s the InT subgraph.
+
+template <typename OutT, typename InT>
+class CastBackward : public Node<OutT> {
+    Tensor<InT> input_;
+    std::shared_ptr<Node<InT>> input_fn_;
+public:
+    explicit CastBackward(const Tensor<InT>& x)
+        : input_(Tensor<InT>::alias(x))
+        , input_fn_(x.grad_fn())
+    {}
+
+    std::vector<Tensor<OutT>> apply(const Tensor<OutT>& propagated_grad) override
+    {
+        const auto g = propagated_grad.contiguous();
+        std::vector<InT> storage(static_cast<size_t>(g.numel()));
+        const auto& gd = g.data();
+        for (size_t i = 0; i < storage.size(); ++i)
+            storage[i] = static_cast<InT>(gd[i]);
+        const Tensor<InT> grad_in = Tensor<InT>::from_operation_result(
+            g.shape(), std::move(storage), false, nullptr);
+
+        if (input_fn_)
+            run_backward(input_fn_, grad_in);
+        else if (input_.requires_grad())
+            input_.accumulate_grad(grad_in);
+        return {};
+    }
+};
+
+template <typename T>
+class CastBackward<T, T> : public Node<T> {
+public:
+    explicit CastBackward(const Tensor<T>& x) : Node<T>(x) {}
+
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
+    {
+        return {propagated_grad};
     }
 };
 
