@@ -12,17 +12,19 @@
 namespace ops {
 
 template <typename T>
-void check_same_shapes(const tensor::Tensor<T>& x, const tensor::Tensor<T>& y, const std::string& op_name) {
-    if (x.shape() != y.shape()) {
+void check_same_shapes(
+    const tensor::Tensor<T>& x, 
+    const tensor::Tensor<T>& y, 
+    const std::string& op_name
+) {
+    if (x.shape() != y.shape())
         throw std::invalid_argument(op_name + " requires tensors with matching shapes");
-    }
 }
 
 // ----- basic operations -----
 
 template <typename T>
-tensor::Tensor<T> add(const tensor::Tensor<T>& x, const tensor::Tensor<T>& y) 
-{   
+tensor::Tensor<T> add(const tensor::Tensor<T>& x, const tensor::Tensor<T>& y) {   
     check_same_shapes(x, y, "add");
 
     // create data buffer
@@ -67,7 +69,6 @@ tensor::Tensor<T> subtract(const tensor::Tensor<T>& x, const tensor::Tensor<T>& 
     std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
     if (requires_grad)
         grad_fn = std::make_shared<autograd::SubtractBackward<T>>(x, y);
-
     return tensor::Tensor<T>::from_operation_result(
         x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
     );
@@ -134,7 +135,22 @@ tensor::Tensor<T> abs(const tensor::Tensor<T>& x) {
     const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
     std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
     if (requires_grad)
-        grad_fn = std::make_shared<autograd::AbsBackward<T>>(x);
+    grad_fn = std::make_shared<autograd::AbsBackward<T>>(x);
+    return tensor::Tensor<T>::from_operation_result(
+        x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
+    );
+}
+
+template <typename T>
+tensor::Tensor<T> sqrt(const tensor::Tensor<T>& x) {
+    std::vector<T> storage(static_cast<size_t>(x.numel()));
+    for (size_t index = 0; index < storage.size(); ++index)
+        storage[index] = static_cast<T>(std::sqrt(x.data()[index]));
+
+    const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
+    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
+    if (requires_grad)
+        grad_fn = std::make_shared<autograd::SqrtBackward<T>>(x);
     return tensor::Tensor<T>::from_operation_result(
         x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
     );
@@ -159,28 +175,17 @@ tensor::Tensor<T> exp(const tensor::Tensor<T>& x) {
 template <typename T>
 tensor::Tensor<T> log(const tensor::Tensor<T>& x) {
     std::vector<T> storage(static_cast<size_t>(x.numel()));
-    for (size_t index = 0; index < storage.size(); ++index)
-        storage[index] = static_cast<T>(std::log(x.data()[index]));
+    for (size_t index = 0; index < storage.size(); ++index) {
+        const auto x_i = x.data()[index];
+        if (x_i <= static_cast<T>(0)) 
+            throw std::runtime_error("log of non-positive value");
+        storage[index] = static_cast<T>(std::log(x_i));
+    }
 
     const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
     std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
     if (requires_grad)
         grad_fn = std::make_shared<autograd::LogBackward<T>>(x);
-    return tensor::Tensor<T>::from_operation_result(
-        x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
-    );
-}
-
-template <typename T>
-tensor::Tensor<T> sqrt(const tensor::Tensor<T>& x) {
-    std::vector<T> storage(static_cast<size_t>(x.numel()));
-    for (size_t index = 0; index < storage.size(); ++index)
-        storage[index] = static_cast<T>(std::sqrt(x.data()[index]));
-
-    const bool requires_grad = autograd::is_grad_enabled() && x.requires_grad();
-    std::shared_ptr<autograd::Node<T>> grad_fn = nullptr;
-    if (requires_grad)
-        grad_fn = std::make_shared<autograd::SqrtBackward<T>>(x);
     return tensor::Tensor<T>::from_operation_result(
         x.shape(), std::move(storage), requires_grad, std::move(grad_fn)
     );
@@ -305,7 +310,8 @@ tensor::Tensor<T> sigmoid(const tensor::Tensor<T>& x) {
     );
 }
 
-// relu(x) = max(0, x)
+// ReLU (Rectified Linear Unit)
+// ReLU(x) = max(0, x)
 template <typename T>
 tensor::Tensor<T> relu(const tensor::Tensor<T>& x) {
     std::vector<T> storage(static_cast<size_t>(x.numel()));

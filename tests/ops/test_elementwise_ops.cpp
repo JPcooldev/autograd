@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 #include "../doctest/doctest.h"
@@ -6,11 +7,17 @@
 #include "../../src/autograd/autograd.h"
 
 TYPE_TO_STRING(float);
-TYPE_TO_STRING(int);
+TYPE_TO_STRING(double);
+TYPE_TO_STRING(int32_t);
+TYPE_TO_STRING(int64_t);
 
-// ─── add ──────────────────────────────────────────────────────────────────
+// Arithmetic / abs / relu: all four tensor dtypes.
+// Transcendental and smooth activations: float and double only
+// (integer results would truncate to 0/1 and not exercise the op).
 
-TEST_CASE_TEMPLATE("ops::add 2x2", T, float, int) {
+// ─── add ───
+
+TEST_CASE_TEMPLATE("ops::add 2x2", T, float, double, int32_t, int64_t) {
     const tensor::Tensor<T> a({2, 2}, std::vector<T>{1, 2, 3, 4}, false);
     const tensor::Tensor<T> b({2, 2}, std::vector<T>{5, 6, 7, 8}, false);
     const auto result = ops::add(a, b);
@@ -20,9 +27,9 @@ TEST_CASE_TEMPLATE("ops::add 2x2", T, float, int) {
         CHECK(result.data()[i] == expected[i]);
 }
 
-// ─── neg ──────────────────────────────────────────────────────────────────
+// ─── neg ───
 
-TEST_CASE_TEMPLATE("ops::neg 2x2", T, float, int) {
+TEST_CASE_TEMPLATE("ops::neg 2x2", T, float, double, int32_t, int64_t) {
     const tensor::Tensor<T> a({2, 2}, std::vector<T>{1, -2, -3, 4}, false);
     const auto result = ops::neg(a);
     REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
@@ -31,9 +38,9 @@ TEST_CASE_TEMPLATE("ops::neg 2x2", T, float, int) {
         CHECK(result.data()[i] == expected[i]);
 }
 
-// ─── subtract ─────────────────────────────────────────────────────────────
+// ─── subtract ───
 
-TEST_CASE_TEMPLATE("ops::subtract 2x2", T, float, int) {
+TEST_CASE_TEMPLATE("ops::subtract 2x2", T, float, double, int32_t, int64_t) {
     const tensor::Tensor<T> a({2, 2}, std::vector<T>{5, 6, 7, 8}, false);
     const tensor::Tensor<T> b({2, 2}, std::vector<T>{1, 2, 3, 4}, false);
     const auto result = ops::subtract(a, b);
@@ -43,9 +50,9 @@ TEST_CASE_TEMPLATE("ops::subtract 2x2", T, float, int) {
         CHECK(result.data()[i] == expected[i]);
 }
 
-// ─── multiply ─────────────────────────────────────────────────────────────
+// ─── multiply ───
 
-TEST_CASE_TEMPLATE("ops::multiply 2x2", T, float, int) {
+TEST_CASE_TEMPLATE("ops::multiply 2x2", T, float, double, int32_t, int64_t) {
     const tensor::Tensor<T> a({2, 2}, std::vector<T>{1, 2, 3, 4}, false);
     const tensor::Tensor<T> b({2, 2}, std::vector<T>{2, 3, 4, 5}, false);
     const auto result = ops::multiply(a, b);
@@ -55,9 +62,9 @@ TEST_CASE_TEMPLATE("ops::multiply 2x2", T, float, int) {
         CHECK(result.data()[i] == expected[i]);
 }
 
-// ─── divide ───────────────────────────────────────────────────────────────
+// ─── divide ───
 
-TEST_CASE_TEMPLATE("ops::divide 2x2", T, float, int) {
+TEST_CASE_TEMPLATE("ops::divide 2x2", T, float, double, int32_t, int64_t) {
     const tensor::Tensor<T> a({2, 2}, std::vector<T>{2, 6, 12, 20}, false);
     const tensor::Tensor<T> b({2, 2}, std::vector<T>{2,  3,  4,  5}, false);
     const auto result = ops::divide(a, b);
@@ -67,9 +74,9 @@ TEST_CASE_TEMPLATE("ops::divide 2x2", T, float, int) {
         CHECK(result.data()[i] == expected[i]);
 }
 
-// ─── power ────────────────────────────────────────────────────────────────
+// ─── power ───
 
-TEST_CASE_TEMPLATE("ops::power 2x2 exponent=2", T, float, int) {
+TEST_CASE_TEMPLATE("ops::power 2x2 exponent=2", T, float, double, int32_t, int64_t) {
     const tensor::Tensor<T> a({2, 2}, std::vector<T>{1, 2, 3, 4}, false);
     const auto result = ops::power(a, static_cast<T>(2));
     REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
@@ -78,9 +85,9 @@ TEST_CASE_TEMPLATE("ops::power 2x2 exponent=2", T, float, int) {
         CHECK(result.data()[i] == expected[i]);
 }
 
-// ─── abs ──────────────────────────────────────────────────────────────────
+// ─── abs ───
 
-TEST_CASE_TEMPLATE("ops::abs 2x2", T, float, int) {
+TEST_CASE_TEMPLATE("ops::abs 2x2", T, float, double, int32_t, int64_t) {
     const tensor::Tensor<T> a({2, 2}, std::vector<T>{-1, 2, -3, 4}, false);
     const auto result = ops::abs(a);
     REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
@@ -89,78 +96,135 @@ TEST_CASE_TEMPLATE("ops::abs 2x2", T, float, int) {
         CHECK(result.data()[i] == expected[i]);
 }
 
-// ─── exp / log / sin / cos / tan  (float only) ────────────────────────────
+// ─── sqrt ───
 
-TEST_CASE("ops::exp 2x2") {
-    const std::vector<float> input{1.F, 2.F, 3.F, 4.F};
-    const tensor::Tensor<float> a({2, 2}, input, false);
+TEST_CASE_TEMPLATE("ops::sqrt perfect squares", T, float, double, int32_t, int64_t) {
+    const tensor::Tensor<T> a({2}, std::vector<T>{4, 9}, false);
+    const auto result = ops::sqrt(a);
+    CHECK(result.shape() == std::vector<int64_t>{2});
+    CHECK(result.data()[0] == static_cast<T>(2));
+    CHECK(result.data()[1] == static_cast<T>(3));
+}
+
+TEST_CASE_TEMPLATE("ops::sqrt backward is 0.5 / sqrt(x)", T, float, double) {
+    tensor::Tensor<T> x({2}, std::vector<T>{4, 9}, true);
+    x.sqrt().sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(static_cast<T>(0.25)));
+    CHECK(x.grad()->data()[1] == doctest::Approx(static_cast<T>(1) / static_cast<T>(6)));
+}
+
+// ─── exp / log / sin / cos / tan ───
+
+TEST_CASE_TEMPLATE("ops::exp 2x2", T, float, double) {
+    const std::vector<T> input{1, 2, 3, 4};
+    const tensor::Tensor<T> a({2, 2}, input, false);
     const auto result = ops::exp(a);
     REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
     for (size_t i = 0; i < input.size(); ++i)
         CHECK(result.data()[i] == doctest::Approx(std::exp(input[i])));
 }
 
-TEST_CASE("ops::log 2x2") {
-    const std::vector<float> input{1.F, 2.F, 3.F, 4.F};
-    const tensor::Tensor<float> a({2, 2}, input, false);
+TEST_CASE_TEMPLATE("ops::log 2x2", T, float, double) {
+    const std::vector<T> input{1, 2, 3, 4};
+    const tensor::Tensor<T> a({2, 2}, input, false);
     const auto result = ops::log(a);
     REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
     for (size_t i = 0; i < input.size(); ++i)
         CHECK(result.data()[i] == doctest::Approx(std::log(input[i])));
 }
 
-TEST_CASE("ops::sin 2x2") {
-    const std::vector<float> input{0.F, 1.F, 2.F, 3.F};
-    const tensor::Tensor<float> a({2, 2}, input, false);
+TEST_CASE_TEMPLATE("ops::sin 2x2", T, float, double) {
+    const std::vector<T> input{0, 1, 2, 3};
+    const tensor::Tensor<T> a({2, 2}, input, false);
     const auto result = ops::sin(a);
     REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
     for (size_t i = 0; i < input.size(); ++i)
         CHECK(result.data()[i] == doctest::Approx(std::sin(input[i])));
 }
 
-TEST_CASE("ops::cos 2x2") {
-    const std::vector<float> input{0.F, 1.F, 2.F, 3.F};
-    const tensor::Tensor<float> a({2, 2}, input, false);
+TEST_CASE_TEMPLATE("ops::cos 2x2", T, float, double) {
+    const std::vector<T> input{0, 1, 2, 3};
+    const tensor::Tensor<T> a({2, 2}, input, false);
     const auto result = ops::cos(a);
     REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
     for (size_t i = 0; i < input.size(); ++i)
         CHECK(result.data()[i] == doctest::Approx(std::cos(input[i])));
 }
 
-TEST_CASE("ops::tan 2x2") {
-    const std::vector<float> input{0.F, 0.5F, 1.F, 1.5F};
-    const tensor::Tensor<float> a({2, 2}, input, false);
+TEST_CASE_TEMPLATE("ops::tan 2x2", T, float, double) {
+    const std::vector<T> input{
+        static_cast<T>(0),
+        static_cast<T>(0.5),
+        static_cast<T>(1),
+        static_cast<T>(1.5)
+    };
+    const tensor::Tensor<T> a({2, 2}, input, false);
     const auto result = ops::tan(a);
     REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
     for (size_t i = 0; i < input.size(); ++i)
         CHECK(result.data()[i] == doctest::Approx(std::tan(input[i])));
 }
 
-// ─── sigmoid (float only) ─────────────────────────────────────────────────
+// ─── hyperbolic ───
 
-TEST_CASE("ops::sigmoid 2x2") {
-    const std::vector<float> input{-2.F, -1.F, 0.F, 1.F, 2.F, 3.F, -3.F, 0.5F};
-    const tensor::Tensor<float> a({2, 4}, input, false);
+TEST_CASE_TEMPLATE("ops::sinh 2x2", T, float, double) {
+    const std::vector<T> input{
+        static_cast<T>(0),
+        static_cast<T>(1),
+        static_cast<T>(-1),
+        static_cast<T>(0.5)
+    };
+    const tensor::Tensor<T> a({2, 2}, input, false);
+    const auto result = ops::sinh(a);
+    for (size_t i = 0; i < input.size(); ++i)
+        CHECK(result.data()[i] == doctest::Approx(std::sinh(input[i])));
+}
+
+TEST_CASE_TEMPLATE("ops::cosh", T, float, double) {
+    const tensor::Tensor<T> a({2}, std::vector<T>{0, 1}, false);
+    const auto result = ops::cosh(a);
+    CHECK(result.data()[0] == doctest::Approx(static_cast<T>(1)));
+    CHECK(result.data()[1] == doctest::Approx(std::cosh(static_cast<T>(1))));
+}
+
+TEST_CASE_TEMPLATE("ops::tanh", T, float, double) {
+    const tensor::Tensor<T> a({2}, std::vector<T>{0, 1}, false);
+    const auto result = ops::tanh(a);
+    CHECK(result.data()[0] == doctest::Approx(static_cast<T>(0)));
+    CHECK(result.data()[1] == doctest::Approx(std::tanh(static_cast<T>(1))));
+}
+
+// ─── sigmoid ───
+
+TEST_CASE_TEMPLATE("ops::sigmoid 2x2", T, float, double) {
+    const std::vector<T> input{
+        static_cast<T>(-2),
+        static_cast<T>(-1),
+        static_cast<T>(0),
+        static_cast<T>(1)
+    };
+    const tensor::Tensor<T> a({2, 2}, input, false);
     const auto result = ops::sigmoid(a);
-    REQUIRE(result.shape() == std::vector<int64_t>{2, 4});
+    REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
     for (size_t i = 0; i < input.size(); ++i) {
-        const float expected = 1.F / (1.F + std::exp(-input[i]));
+        const T expected = static_cast<T>(1) / (static_cast<T>(1) + static_cast<T>(std::exp(-input[i])));
         CHECK(result.data()[i] == doctest::Approx(expected));
     }
 }
 
-TEST_CASE("ops::sigmoid output is in (0, 1)") {
-    const tensor::Tensor<float> a({2, 2}, std::vector<float>{-10.F, -1.F, 1.F, 10.F}, false);
+TEST_CASE_TEMPLATE("ops::sigmoid output is in (0, 1)", T, float, double) {
+    const tensor::Tensor<T> a({2, 2}, std::vector<T>{-10, -1, 1, 10}, false);
     const auto result = ops::sigmoid(a);
-    for (const float v : result.data()) {
-        CHECK(v > 0.F);
-        CHECK(v < 1.F);
+    for (const T v : result.data()) {
+        CHECK(v > static_cast<T>(0));
+        CHECK(v < static_cast<T>(1));
     }
 }
 
-// ─── relu (float and int) ─────────────────────────────────────────────────
+// ─── relu ───
 
-TEST_CASE_TEMPLATE("ops::relu zeros negatives 2x2", T, float, int) {
+TEST_CASE_TEMPLATE("ops::relu zeros negatives 2x2", T, float, double, int32_t, int64_t) {
     const tensor::Tensor<T> a({2, 2}, std::vector<T>{-3, -1, 0, 4}, false);
     const auto result = ops::relu(a);
     REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
@@ -169,7 +233,7 @@ TEST_CASE_TEMPLATE("ops::relu zeros negatives 2x2", T, float, int) {
         CHECK(result.data()[i] == expected[i]);
 }
 
-TEST_CASE_TEMPLATE("ops::relu passes positive values unchanged", T, float, int) {
+TEST_CASE_TEMPLATE("ops::relu passes positive values unchanged", T, float, double, int32_t, int64_t) {
     const tensor::Tensor<T> a({2, 2}, std::vector<T>{1, 2, 3, 4}, false);
     const auto result = ops::relu(a);
     REQUIRE(result.shape() == std::vector<int64_t>{2, 2});
@@ -177,63 +241,23 @@ TEST_CASE_TEMPLATE("ops::relu passes positive values unchanged", T, float, int) 
         CHECK(result.data()[i] == a.data()[i]);
 }
 
-TEST_CASE("ops::sinh 2x2") {
-    const tensor::Tensor<float> a({2, 2}, std::vector<float>{0.f, 1.f, -1.f, 0.5f}, false);
-    const auto result = a.sinh();
-    const std::vector<float> expected{
-        0.f,
-        std::sinh(1.f),
-        std::sinh(-1.f),
-        std::sinh(0.5f)
-    };
-    for (size_t i = 0; i < expected.size(); ++i)
-        CHECK(result.data()[i] == doctest::Approx(expected[i]));
+// ─── silu / gelu ───
+
+TEST_CASE_TEMPLATE("ops::silu is x * sigmoid(x)", T, float, double) {
+    const tensor::Tensor<T> a({2}, std::vector<T>{0, 2}, false);
+    const auto result = ops::silu(a);
+    const T sig2 = static_cast<T>(1) / (static_cast<T>(1) + static_cast<T>(std::exp(static_cast<T>(-2))));
+    CHECK(result.data()[0] == doctest::Approx(static_cast<T>(0)));
+    CHECK(result.data()[1] == doctest::Approx(static_cast<T>(2) * sig2));
 }
 
-TEST_CASE("ops::cosh 2x2") {
-    const tensor::Tensor<float> a({2}, std::vector<float>{0.f, 1.f}, false);
-    const auto result = a.cosh();
-    CHECK(result.data()[0] == doctest::Approx(1.f));
-    CHECK(result.data()[1] == doctest::Approx(std::cosh(1.f)));
-}
-
-TEST_CASE("ops::tanh 2x2") {
-    const tensor::Tensor<float> a({2}, std::vector<float>{0.f, 1.f}, false);
-    const auto result = a.tanh();
-    CHECK(result.data()[0] == doctest::Approx(0.f));
-    CHECK(result.data()[1] == doctest::Approx(std::tanh(1.f)));
-}
-
-TEST_CASE("ops::silu is x * sigmoid(x)") {
-    const tensor::Tensor<float> a({2}, std::vector<float>{0.f, 2.f}, false);
-    const auto result = a.silu();
-    const float sig2 = 1.f / (1.f + std::exp(-2.f));
-    CHECK(result.data()[0] == doctest::Approx(0.f));
-    CHECK(result.data()[1] == doctest::Approx(2.f * sig2));
-}
-
-TEST_CASE("ops::gelu tanh approximation") {
-    const tensor::Tensor<float> a({2}, std::vector<float>{0.f, 1.f}, false);
-    const auto result = a.gelu();
-    const float k = static_cast<float>(std::sqrt(2.0 / 3.14159265358979323846));
-    const float x = 1.f;
-    const float expected = 0.5f * x * (1.f + std::tanh(k * (x + 0.044715f * x * x * x)));
-    CHECK(result.data()[0] == doctest::Approx(0.f));
+TEST_CASE_TEMPLATE("ops::gelu tanh approximation", T, float, double) {
+    const tensor::Tensor<T> a({2}, std::vector<T>{0, 1}, false);
+    const auto result = ops::gelu(a);
+    const T k = static_cast<T>(std::sqrt(2.0 / 3.14159265358979323846));
+    const T x = static_cast<T>(1);
+    const T expected = static_cast<T>(0.5) * x
+        * (static_cast<T>(1) + static_cast<T>(std::tanh(k * (x + static_cast<T>(0.044715) * x * x * x))));
+    CHECK(result.data()[0] == doctest::Approx(static_cast<T>(0)));
     CHECK(result.data()[1] == doctest::Approx(expected));
-}
-
-TEST_CASE("ops::sqrt 1-D") {
-    const tensor::Tensor<float> a({2}, std::vector<float>{4.f, 9.f}, false);
-    const auto result = ops::sqrt(a);
-    CHECK(result.shape() == std::vector<int64_t>{2});
-    CHECK(result.data()[0] == doctest::Approx(2.f));
-    CHECK(result.data()[1] == doctest::Approx(3.f));
-}
-
-TEST_CASE("ops::sqrt backward is 0.5 / sqrt(x)") {
-    tensor::Tensor<float> x({2}, std::vector<float>{4.f, 9.f}, true);
-    x.sqrt().sum().backward();
-    REQUIRE(x.grad() != nullptr);
-    CHECK(x.grad()->data()[0] == doctest::Approx(0.25f));
-    CHECK(x.grad()->data()[1] == doctest::Approx(1.f / 6.f));
 }
