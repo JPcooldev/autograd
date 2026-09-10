@@ -1,3 +1,13 @@
+/*
+ * Tensor metadata accessors: rank, layout, dtype, leaf vs view.
+ *
+ * - rank / ndim / numel / shape
+ * - contiguous owner strides and offset
+ * - dtype and requires_grad
+ * - leaf has null grad_fn; data() is the buffer
+ * - transpose is a non-contiguous view sharing storage
+ */
+
 #include <cstdint>
 #include <vector>
 

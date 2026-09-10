@@ -1,6 +1,6 @@
 # Optimizer mathematics
 
-Formulas implemented by `nn::optim`. How this library stores gradients and applies the update is in [mechanism.md](mechanism.md).
+Formulas implemented by `nn::optim`. Constructors and defaults: [reference.md](reference.md). How this library stores gradients and applies the update is in [mechanism.md](mechanism.md).
 
 Notation for one parameter tensor, written elementwise:
 

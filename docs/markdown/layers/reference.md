@@ -4,6 +4,46 @@ Short cards for every `nn::` layer. Internals and the leaf/`alias` contract are 
 
 Default layout for conv/pool is **NCHW**. RNN default is **seq-first** `(T, N, F)`.
 
+There is no `Sequential` and no activation layers (`ReLU`, `GELU`, …). Use `ops::relu` / `x.relu()` and subclass `Module` to stack layers. See [howto.md](../howto.md).
+
+---
+
+## Module / Layer
+
+**Headers:** `src/nn/layers/layer.h`, `src/nn/module.h`
+
+`Layer<T>` is the base: `train` / `eval` / `training()`, `named_parameters()`, `named_buffers()`, `parameters()`, `state_dict()`. There is **no** virtual `forward`.
+
+`Module<T>` is a `Layer` that owns named children. Store sub-layers as members; they must outlive the module.
+
+```cpp
+void register_module(const std::string& name, Layer<T>& mod)
+void register_parameter(const std::string& name, Tensor<T>& param)  // requires_grad
+void register_buffer(const std::string& name, Tensor<T>& buf)
+void train(bool mode = true)   // recurses into children; eval() = train(false)
+NamedTensorList named_parameters()
+NamedTensorList named_buffers()
+int64_t num_parameters()
+void zero_grad()
+```
+
+Empty names, duplicate names, registering the same object twice, or `register_parameter` on a tensor without `requires_grad` throw `std::invalid_argument`.
+
+```cpp
+class MLP : public nn::Module<float> {
+public:
+    nn::Linear<float> fc1{4, 8};
+    nn::Linear<float> fc2{8, 2};
+    MLP() {
+        register_module("fc1", fc1);
+        register_module("fc2", fc2);
+    }
+    tensor::Tensor<float> forward(const tensor::Tensor<float>& x) const {
+        return fc2.forward(ops::relu(fc1.forward(x)));
+    }
+};
+```
+
 ---
 
 ## Identity
@@ -22,9 +62,27 @@ Tensor forward(const Tensor& input) const  // same tensor
 Fully connected: \(y = x W^\top + b\) (bias optional).
 
 - **Ctor:** `Linear(in_features, out_features, use_bias=true)`
-- **Input:** `{in}` or `{N, in}` → `{out}` or `{N, out}`
+- **Input:** `{in}` or `{..., in}` → `{out}` or `{..., out}` (feature axis is last)
 - **Parameters:** `weight {out, in}`, optional `bias {out}`
 - **Init:** `kaiming_uniform(W, a=√5)` = \(U(-1/\sqrt{\mathrm{fan\_in}},\, 1/\sqrt{\mathrm{fan\_in}})\); bias the same bound (not zeros)
+
+---
+
+## Embedding
+
+Row lookup: \(y = W[\text{indices}]\). Integer indices are not differentiated; backward scatter-adds into `weight`.
+
+- **Ctor:** `Embedding(num_embeddings, embedding_dim)`
+- **Input:** integer `Tensor<int32_t>` or `Tensor<int64_t>` of any rank
+- **Output:** `indices.shape + {embedding_dim}`
+- **Parameters:** `weight {V, D}`
+- **Init:** `randn` — i.i.d. \(\mathcal{N}(0, 1)\) (PyTorch `nn.Embedding` default)
+
+```cpp
+nn::Embedding<float> emb(65, 32);
+tensor::Tensor<int32_t> idx({2, 16}, token_ids, false);
+auto x = emb.forward(idx);  // {2, 16, 32}
+```
 
 ---
 
@@ -122,11 +180,11 @@ Inverted dropout. No parameters. `forward` is **non-const** (reads `training_`).
 
 ## MSELoss / L1Loss / CrossEntropyLoss / BCELoss / BCEWithLogitsLoss / KLDivLoss
 
-Thin wrappers around `ops::*`. No parameters. `forward(input, target)`.
+Thin wrappers around `ops::*`. No parameters. `forward(input, target)`. Layers always use the op's default reduction (mean). There is **no** `NLLLoss` layer — call `ops::nll_loss` if you already have log-probs.
 
 | Class | Op | Notes vs PyTorch |
 | --- | --- | --- |
-| `MSELoss` | `mse_loss` | mean reduction |
+| `MSELoss` | `l2_loss` / `mse_loss` | mean reduction |
 | `L1Loss` | `l1_loss` | MAE, mean |
 | `CrossEntropyLoss` | `cross_entropy_loss` | **soft labels**, same shape as logits (not class indices) |
 | `BCELoss` | `bce_loss` | |
@@ -140,8 +198,37 @@ Thin wrappers around `ops::*`. No parameters. `forward(input, target)`.
 | Module | Weights | Bias / extra |
 | --- | --- | --- |
 | Linear, Conv*, ConvTranspose* | `kaiming_uniform(a=√5)` | \(U(-1/\sqrt{fan_{in}}, 1/\sqrt{fan_{in}})\) |
+| Embedding | \(\mathcal{N}(0, 1)\) | — |
 | RNN, LSTM, GRU | \(U(-1/\sqrt{H}, 1/\sqrt{H})\) on **all** parameters | same, including bias |
 | LayerNorm | ones | zeros |
 | RMSNorm | ones | — |
 | BatchNorm* | ones | zeros; running mean 0, var 1 |
 | Dropout, Pool, Loss, Identity | — | — |
+
+---
+
+## Saving and loading
+
+`src/nn/serialize.h`. The destination model must already exist; load `copy_`s into those tensors so optimizer pointers and `GradStorage` stay valid.
+
+```cpp
+#include "nn/serialize.h"
+
+nn::save(model, "model.agck");
+nn::load(model, "model.agck");                 // strict = true
+nn::load(model, "model.agck", /*strict=*/false);
+```
+
+| API | Role |
+|---|---|
+| `save(layer, path)` | Snapshot `state_dict()` to an AGCK file |
+| `load(layer, path, strict=true)` | Read file, then `load_state_dict` |
+| `snapshot(layer)` | `vector<TensorRecord<T>>` in memory |
+| `load_state_dict(layer, records, strict=true)` | Copy matching names |
+| `write_checkpoint` / `read_checkpoint` | Stream form of the same format |
+
+`TensorRecord` fields: `name`, `shape`, `dtype`, `requires_grad`, `is_buffer`, packed `values`.
+
+Strict mode requires the checkpoint keys to equal the model's `state_dict` keys with the same shape, dtype, `requires_grad`, and parameter-vs-buffer kind. Non-strict skips missing/extra keys (warnings if logging is on). Shape/dtype mismatches still throw.
+
+`named_parameters()` keys are dotted (`fc1.weight`, `cells.0.weight_ih`). Buffers such as BatchNorm `running_mean` are included. See [mechanism.md](mechanism.md#named-parameters-buffers-and-checkpoints).

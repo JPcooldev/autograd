@@ -19,20 +19,35 @@ namespace nn {
 
 namespace rnn_detail {
 
+/**
+ * Affine map `x @ W.T [+ b]` used inside recurrent cells.
+ * `matmul`s `x` with `w.transpose()`; if `b` is set, broadcasts it over the batch and adds.
+ *
+ * @param x Rank-2 input `{batch, in}`.
+ * @param w Weight `{out, in}`.
+ * @param b Optional bias `{out}`.
+ * @return Rank-2 `{batch, out}`.
+ */
 template <typename T>
 tensor::Tensor<T> linear(const tensor::Tensor<T>& x,
                          const tensor::Tensor<T>& w,
-                         const std::optional<tensor::Tensor<T>>& b)
-{
+                         const std::optional<tensor::Tensor<T>>& b) {
     auto y = ops::matmul(x, w.transpose());
-    if (!b) return y;
+    if (!b)
+        return y;
     auto bb = b->unsqueeze(0).broadcast_to(y.shape()).contiguous();
     return ops::add(y, bb);
 }
 
+/**
+ * Allocate a learnable tensor with U(-1/√H, 1/√H).
+ *
+ * @param shape Tensor shape.
+ * @param hidden Hidden size H used for the uniform bound.
+ * @return New tensor with `requires_grad == true`.
+ */
 template <typename T>
-tensor::Tensor<T> uniform_param(const std::vector<int64_t>& shape, int64_t hidden)
-{
+tensor::Tensor<T> uniform_param(const std::vector<int64_t>& shape, int64_t hidden) {
     const T bound = static_cast<T>(1.0 / std::sqrt(static_cast<double>(hidden)));
     return tensor::Tensor<T>::uniform(shape, -bound, bound, true);
 }
@@ -45,9 +60,19 @@ struct CellWeights {
     std::optional<tensor::Tensor<T>> bias_hh;
 };
 
+/**
+ * Build one recurrent cell's weights and optional biases.
+ * `weight_ih` is `{gate_mult * H, input_size}`, `weight_hh` is `{gate_mult * H, H}`;
+ * biases match `{gate_mult * H}` when `use_bias` is true. All use `uniform_param`.
+ *
+ * @param input_size Input feature size for this layer.
+ * @param hidden_size Hidden size H.
+ * @param gate_mult 1 (RNN), 4 (LSTM), or 3 (GRU).
+ * @param use_bias Whether to allocate `bias_ih` and `bias_hh`.
+ * @return Populated `CellWeights`.
+ */
 template <typename T>
-CellWeights<T> make_cell(int64_t input_size, int64_t hidden_size, int64_t gate_mult, bool use_bias)
-{
+CellWeights<T> make_cell(int64_t input_size, int64_t hidden_size, int64_t gate_mult, bool use_bias) {
     std::optional<tensor::Tensor<T>> b_ih;
     std::optional<tensor::Tensor<T>> b_hh;
     if (use_bias) {
@@ -62,21 +87,49 @@ CellWeights<T> make_cell(int64_t input_size, int64_t hidden_size, int64_t gate_m
     };
 }
 
+/**
+ * Append a cell's learnable tensors to `out` with PyTorch-style names.
+ * Names are `weight_ih_l{layer}`, `weight_hh_l{layer}`, and optional biases;
+ * reverse cells add the `_reverse` suffix.
+ *
+ * @param out Named parameter list being collected.
+ * @param c Cell whose tensors are appended.
+ * @param layer Layer index (0-based).
+ * @param reverse True for the reverse direction of a bidirectional RNN.
+ */
 template <typename T>
-void collect_cell(std::vector<tensor::Tensor<T>*>& out, CellWeights<T>& c)
-{
-    out.push_back(&c.weight_ih);
-    out.push_back(&c.weight_hh);
-    if (c.bias_ih) out.push_back(&(*c.bias_ih));
-    if (c.bias_hh) out.push_back(&(*c.bias_hh));
+void collect_cell_named(
+    NamedTensorList<T>& out,
+    CellWeights<T>& c,
+    int64_t layer,
+    bool reverse
+) {
+    const std::string suffix = reverse
+        ? ("_l" + std::to_string(layer) + "_reverse")
+        : ("_l" + std::to_string(layer));
+    out.emplace_back("weight_ih" + suffix, &c.weight_ih);
+    out.emplace_back("weight_hh" + suffix, &c.weight_hh);
+    if (c.bias_ih)
+        out.emplace_back("bias_ih" + suffix, &(*c.bias_ih));
+    if (c.bias_hh)
+        out.emplace_back("bias_hh" + suffix, &(*c.bias_hh));
 }
 
+/**
+ * One Elman RNN step: tanh or ReLU of the pre-activation.
+ * Pre-activation is `linear(x, W_ih, b_ih) + linear(h, W_hh, b_hh)`. `"relu"` selects ReLU; anything else uses tanh.
+ *
+ * @param x Input at this time `{batch, in}`.
+ * @param h Hidden state `{batch, H}`.
+ * @param w Cell weights.
+ * @param nonlinearity `"relu"` or `"tanh"`.
+ * @return Next hidden state `{batch, H}`.
+ */
 template <typename T>
 tensor::Tensor<T> rnn_step(const tensor::Tensor<T>& x,
                            const tensor::Tensor<T>& h,
                            const CellWeights<T>& w,
-                           const std::string& nonlinearity)
-{
+                           const std::string& nonlinearity) {
     auto pre = ops::add(linear(x, w.weight_ih, w.bias_ih),
                         linear(h, w.weight_hh, w.bias_hh));
     if (nonlinearity == "relu")
@@ -84,13 +137,23 @@ tensor::Tensor<T> rnn_step(const tensor::Tensor<T>& x,
     return ops::tanh(pre);
 }
 
+/**
+ * One LSTM step (input, forget, cell, output gates).
+ * Splits the 4H pre-activation along the last axis into i, f, n, o; updates
+ * `c_n = f⊙c + i⊙n` and `h_n = o⊙tanh(c_n)`.
+ *
+ * @param x Input at this time `{batch, in}`.
+ * @param h Hidden state `{batch, H}`.
+ * @param c Cell state `{batch, H}`.
+ * @param w Cell weights with `gate_mult == 4`.
+ * @return Pair `(h_n, c_n)`.
+ */
 template <typename T>
 std::pair<tensor::Tensor<T>, tensor::Tensor<T>> lstm_step(
     const tensor::Tensor<T>& x,
     const tensor::Tensor<T>& h,
     const tensor::Tensor<T>& c,
-    const CellWeights<T>& w)
-{
+    const CellWeights<T>& w) {
     const int64_t H = h.shape().back();
     auto g = ops::add(linear(x, w.weight_ih, w.bias_ih),
                       linear(h, w.weight_hh, w.bias_hh));
@@ -103,11 +166,19 @@ std::pair<tensor::Tensor<T>, tensor::Tensor<T>> lstm_step(
     return {h_n, c_n};
 }
 
+/**
+ * One GRU step (reset, update, new gates).
+ * Uses the PyTorch split of `W_ih`/`W_hh` into r, z, n; returns `(1-z)⊙n + z⊙h`.
+ *
+ * @param x Input at this time `{batch, in}`.
+ * @param h Hidden state `{batch, H}`.
+ * @param w Cell weights with `gate_mult == 3`.
+ * @return Next hidden state `{batch, H}`.
+ */
 template <typename T>
 tensor::Tensor<T> gru_step(const tensor::Tensor<T>& x,
                            const tensor::Tensor<T>& h,
-                           const CellWeights<T>& w)
-{
+                           const CellWeights<T>& w) {
     const int64_t H = h.shape().back();
     auto gi = linear(x, w.weight_ih, w.bias_ih);
     auto gh = linear(h, w.weight_hh, w.bias_hh);
@@ -120,18 +191,32 @@ tensor::Tensor<T> gru_step(const tensor::Tensor<T>& x,
     return ops::add(ops::multiply(omz, n), ops::multiply(z, h));
 }
 
+/**
+ * Extract the feature slice at time `t`.
+ * Seq-first `(T, N, F)` uses dim 0; batch-first `(N, T, F)` uses dim 1.
+ *
+ * @param seq Rank-3 sequence tensor.
+ * @param t Time index.
+ * @param batch_first Layout flag.
+ * @return Rank-2 `{N, F}` slice.
+ */
 template <typename T>
-tensor::Tensor<T> time_slice(const tensor::Tensor<T>& seq, int64_t t, bool batch_first)
-{
-    // seq-first (T, N, F) or batch-first (N, T, F)
+tensor::Tensor<T> time_slice(const tensor::Tensor<T>& seq, int64_t t, bool batch_first) {
     if (batch_first)
         return seq.narrow(1, t, 1).squeeze(1);
     return seq.narrow(0, t, 1).squeeze(0);
 }
 
+/**
+ * Stack per-timestep hidden states along the time axis.
+ * Unsqueezes each step on dim 0 (seq-first) or dim 1 (batch-first) and `cat`s.
+ *
+ * @param steps Hidden tensors `{N, H}` in time order.
+ * @param batch_first Layout flag.
+ * @return Rank-3 sequence of hiddens.
+ */
 template <typename T>
-tensor::Tensor<T> stack_time(const std::vector<tensor::Tensor<T>>& steps, bool batch_first)
-{
+tensor::Tensor<T> stack_time(const std::vector<tensor::Tensor<T>>& steps, bool batch_first) {
     std::vector<tensor::Tensor<T>> unsqueezed;
     unsqueezed.reserve(steps.size());
     const int64_t dim = batch_first ? 1 : 0;
@@ -144,17 +229,37 @@ tensor::Tensor<T> stack_time(const std::vector<tensor::Tensor<T>>& steps, bool b
 
 template <typename T>
 class RNN : public Layer<T> {
+private:
+    int64_t input_size_, hidden_size_, num_layers_;
+    bool batch_first_, bidirectional_;
+    std::string nonlinearity_;
+
 public:
     std::vector<rnn_detail::CellWeights<T>> cells;          // forward, size num_layers
     std::vector<rnn_detail::CellWeights<T>> cells_reverse;  // empty if not bidirectional
 
+    /**
+     * Construct a stacked Elman RNN.
+     * Builds `num_layers` cells (`gate_mult == 1`); if bidirectional, also reverse cells.
+     * Layer l>0 input size is `hidden_size * num_directions`. Weights and biases use U(-1/√H, 1/√H).
+     *
+     * @param input_size Feature size of the input sequence.
+     * @param hidden_size Hidden size H.
+     * @param num_layers Number of stacked layers. Default 1.
+     * @param use_bias Whether cells have biases. Default true.
+     * @param batch_first If true, input layout is `(N, T, F)`; else `(T, N, F)`. Default false.
+     * @param bidirectional If true, each layer has a reverse cell. Default false.
+     * @param nonlinearity `"tanh"` or `"relu"`. Default `"tanh"`.
+     *
+     * @throws std::invalid_argument if `nonlinearity` is not `"tanh"` or `"relu"`.
+     * @throws std::invalid_argument if `num_layers < 1`.
+     */
     RNN(int64_t input_size, int64_t hidden_size, int64_t num_layers = 1,
         bool use_bias = true, bool batch_first = false, bool bidirectional = false,
         std::string nonlinearity = "tanh")
         : input_size_(input_size), hidden_size_(hidden_size), num_layers_(num_layers),
           batch_first_(batch_first), bidirectional_(bidirectional),
-          nonlinearity_(std::move(nonlinearity))
-    {
+          nonlinearity_(std::move(nonlinearity)) {
         if (nonlinearity_ != "tanh" && nonlinearity_ != "relu")
             throw std::invalid_argument("RNN: nonlinearity must be \"tanh\" or \"relu\"");
         if (num_layers < 1)
@@ -169,22 +274,51 @@ public:
         }
     }
 
+    /**
+     * Run the RNN with zero initial hidden state.
+     * Forwards to `forward(input, nullopt)`.
+     *
+     * @param input Rank-3 sequence `(T, N, F)` or `(N, T, F)` if `batch_first`.
+     * @return `(output, h_n)` with `h_n` shape `(num_layers * num_directions, N, H)`.
+     *
+     * @throws std::invalid_argument if `input` is not rank 3.
+     */
     std::pair<tensor::Tensor<T>, tensor::Tensor<T>>
-    forward(const tensor::Tensor<T>& input) const
-    {
+    forward(const tensor::Tensor<T>& input) const {
         return forward(input, std::nullopt);
     }
 
+    /**
+     * Run the RNN with an explicit initial hidden state.
+     * Wraps `h0` in `optional` and forwards to the three-argument `forward`.
+     *
+     * @param input Rank-3 sequence.
+     * @param h0 Initial hidden `(num_layers * num_directions, N, H)`.
+     * @return `(output, h_n)`.
+     *
+     * @throws std::invalid_argument if `input` is not rank 3.
+     * @throws std::invalid_argument if `h0` cannot be narrowed to each layer's hidden (out of range).
+     */
     std::pair<tensor::Tensor<T>, tensor::Tensor<T>>
-    forward(const tensor::Tensor<T>& input, const tensor::Tensor<T>& h0) const
-    {
+    forward(const tensor::Tensor<T>& input, const tensor::Tensor<T>& h0) const {
         return forward(input, std::optional<tensor::Tensor<T>>(h0));
     }
 
+    /**
+     * Unroll the stacked (optionally bidirectional) Elman RNN.
+     * Each layer runs forward in time; reverse direction runs backward then concatenates on the
+     * feature axis. Output width is `H` or `2H` if bidirectional. Missing `h0` is zeros `{N, H}`.
+     *
+     * @param input Rank-3 sequence `(T, N, F)` or `(N, T, F)` if `batch_first`.
+     * @param h0 Optional initial hidden `(num_layers * num_directions, N, H)`.
+     * @return `(output, h_n)` where `output` matches input layout with last dim `H` or `2H`.
+     *
+     * @throws std::invalid_argument if `input` is not rank 3.
+     * @throws std::invalid_argument if `h0` is set but slice indices are out of range.
+     */
     std::pair<tensor::Tensor<T>, tensor::Tensor<T>>
     forward(const tensor::Tensor<T>& input,
-            const std::optional<tensor::Tensor<T>>& h0) const
-    {
+            const std::optional<tensor::Tensor<T>>& h0) const {
         if (input.rank() != 3)
             throw std::invalid_argument("RNN: input must be 3-D");
         const int64_t seq_dim = batch_first_ ? 1 : 0;
@@ -230,31 +364,50 @@ public:
         return {seq, ops::cat(h_n_layers, 0)};
     }
 
-    std::vector<tensor::Tensor<T>*> parameters() override
-    {
-        std::vector<tensor::Tensor<T>*> out;
-        for (auto& c : cells) rnn_detail::collect_cell(out, c);
-        for (auto& c : cells_reverse) rnn_detail::collect_cell(out, c);
+    /**
+     * Collect named weights and biases from forward and reverse cells.
+     * Forward cells use `_l{i}` names; reverse cells use `_l{i}_reverse`.
+     *
+     * @return Named tensors in `cells` then `cells_reverse`.
+     */
+    NamedTensorList<T> named_parameters() override {
+        NamedTensorList<T> out;
+        for (size_t i = 0; i < cells.size(); ++i)
+            rnn_detail::collect_cell_named(out, cells[i], static_cast<int64_t>(i), false);
+        for (size_t i = 0; i < cells_reverse.size(); ++i)
+            rnn_detail::collect_cell_named(out, cells_reverse[i], static_cast<int64_t>(i), true);
         return out;
     }
-
-private:
-    int64_t input_size_, hidden_size_, num_layers_;
-    bool batch_first_, bidirectional_;
-    std::string nonlinearity_;
 };
 
 template <typename T>
 class LSTM : public Layer<T> {
+private:
+    int64_t input_size_, hidden_size_, num_layers_;
+    bool batch_first_, bidirectional_;
+
 public:
     std::vector<rnn_detail::CellWeights<T>> cells;
     std::vector<rnn_detail::CellWeights<T>> cells_reverse;
 
+    /**
+     * Construct a stacked LSTM.
+     * Builds `num_layers` cells with `gate_mult == 4` (i, f, n, o); reverse cells if bidirectional.
+     * All parameters use U(-1/√H, 1/√H).
+     *
+     * @param input_size Feature size of the input sequence.
+     * @param hidden_size Hidden size H.
+     * @param num_layers Number of stacked layers. Default 1.
+     * @param use_bias Whether cells have biases. Default true.
+     * @param batch_first If true, input layout is `(N, T, F)`; else `(T, N, F)`. Default false.
+     * @param bidirectional If true, each layer has a reverse cell. Default false.
+     *
+     * @throws std::invalid_argument if `num_layers < 1`.
+     */
     LSTM(int64_t input_size, int64_t hidden_size, int64_t num_layers = 1,
          bool use_bias = true, bool batch_first = false, bool bidirectional = false)
         : input_size_(input_size), hidden_size_(hidden_size), num_layers_(num_layers),
-          batch_first_(batch_first), bidirectional_(bidirectional)
-    {
+          batch_first_(batch_first), bidirectional_(bidirectional) {
         if (num_layers < 1)
             throw std::invalid_argument("LSTM: num_layers must be >= 1");
         int64_t in = input_size;
@@ -267,23 +420,53 @@ public:
         }
     }
 
+    /**
+     * Run the LSTM with zero initial hidden and cell states.
+     * Forwards to `forward(input, nullopt, nullopt)`.
+     *
+     * @param input Rank-3 sequence.
+     * @return `(output, (h_n, c_n))`.
+     *
+     * @throws std::invalid_argument if `input` is not rank 3.
+     */
     std::pair<tensor::Tensor<T>, std::pair<tensor::Tensor<T>, tensor::Tensor<T>>>
-    forward(const tensor::Tensor<T>& input) const
-    {
+    forward(const tensor::Tensor<T>& input) const {
         return forward(input, std::nullopt, std::nullopt);
     }
 
+    /**
+     * Run the LSTM with explicit `h0` and zero `c0`.
+     * Forwards to `forward(input, h0, nullopt)`.
+     *
+     * @param input Rank-3 sequence.
+     * @param h0 Initial hidden `(num_layers * num_directions, N, H)`.
+     * @return `(output, (h_n, c_n))`.
+     *
+     * @throws std::invalid_argument if `input` is not rank 3.
+     * @throws std::invalid_argument if `h0` cannot be narrowed to each layer's hidden.
+     */
     std::pair<tensor::Tensor<T>, std::pair<tensor::Tensor<T>, tensor::Tensor<T>>>
-    forward(const tensor::Tensor<T>& input, const tensor::Tensor<T>& h0) const
-    {
+    forward(const tensor::Tensor<T>& input, const tensor::Tensor<T>& h0) const {
         return forward(input, std::optional<tensor::Tensor<T>>(h0), std::nullopt);
     }
 
+    /**
+     * Unroll the stacked (optionally bidirectional) LSTM.
+     * Each layer updates `(h, c)` with `lstm_step`; reverse direction concatenates on the feature axis.
+     * Missing `h0`/`c0` are zeros `{N, H}`.
+     *
+     * @param input Rank-3 sequence `(T, N, F)` or `(N, T, F)` if `batch_first`.
+     * @param h0 Optional initial hidden `(num_layers * num_directions, N, H)`.
+     * @param c0 Optional initial cell, same shape as `h0`.
+     * @return `(output, (h_n, c_n))` with `h_n`/`c_n` stacked on dim 0.
+     *
+     * @throws std::invalid_argument if `input` is not rank 3.
+     * @throws std::invalid_argument if `h0` or `c0` is set but slice indices are out of range.
+     */
     std::pair<tensor::Tensor<T>, std::pair<tensor::Tensor<T>, tensor::Tensor<T>>>
     forward(const tensor::Tensor<T>& input,
             const std::optional<tensor::Tensor<T>>& h0,
-            const std::optional<tensor::Tensor<T>>& c0) const
-    {
+            const std::optional<tensor::Tensor<T>>& c0) const {
         if (input.rank() != 3)
             throw std::invalid_argument("LSTM: input must be 3-D");
         const int64_t seq_dim = batch_first_ ? 1 : 0;
@@ -334,30 +517,50 @@ public:
         return {seq, {ops::cat(h_n_layers, 0), ops::cat(c_n_layers, 0)}};
     }
 
-    std::vector<tensor::Tensor<T>*> parameters() override
-    {
-        std::vector<tensor::Tensor<T>*> out;
-        for (auto& c : cells) rnn_detail::collect_cell(out, c);
-        for (auto& c : cells_reverse) rnn_detail::collect_cell(out, c);
+    /**
+     * Collect named weights and biases from forward and reverse cells.
+     * Forward cells use `_l{i}` names; reverse cells use `_l{i}_reverse`.
+     *
+     * @return Named tensors in `cells` then `cells_reverse`.
+     */
+    NamedTensorList<T> named_parameters() override {
+        NamedTensorList<T> out;
+        for (size_t i = 0; i < cells.size(); ++i)
+            rnn_detail::collect_cell_named(out, cells[i], static_cast<int64_t>(i), false);
+        for (size_t i = 0; i < cells_reverse.size(); ++i)
+            rnn_detail::collect_cell_named(out, cells_reverse[i], static_cast<int64_t>(i), true);
         return out;
     }
-
-private:
-    int64_t input_size_, hidden_size_, num_layers_;
-    bool batch_first_, bidirectional_;
 };
 
 template <typename T>
 class GRU : public Layer<T> {
+private:
+    int64_t input_size_, hidden_size_, num_layers_;
+    bool batch_first_, bidirectional_;
+
 public:
     std::vector<rnn_detail::CellWeights<T>> cells;
     std::vector<rnn_detail::CellWeights<T>> cells_reverse;
 
+    /**
+     * Construct a stacked GRU.
+     * Builds `num_layers` cells with `gate_mult == 3` (r, z, n); reverse cells if bidirectional.
+     * All parameters use U(-1/√H, 1/√H).
+     *
+     * @param input_size Feature size of the input sequence.
+     * @param hidden_size Hidden size H.
+     * @param num_layers Number of stacked layers. Default 1.
+     * @param use_bias Whether cells have biases. Default true.
+     * @param batch_first If true, input layout is `(N, T, F)`; else `(T, N, F)`. Default false.
+     * @param bidirectional If true, each layer has a reverse cell. Default false.
+     *
+     * @throws std::invalid_argument if `num_layers < 1`.
+     */
     GRU(int64_t input_size, int64_t hidden_size, int64_t num_layers = 1,
         bool use_bias = true, bool batch_first = false, bool bidirectional = false)
         : input_size_(input_size), hidden_size_(hidden_size), num_layers_(num_layers),
-          batch_first_(batch_first), bidirectional_(bidirectional)
-    {
+          batch_first_(batch_first), bidirectional_(bidirectional) {
         if (num_layers < 1)
             throw std::invalid_argument("GRU: num_layers must be >= 1");
         int64_t in = input_size;
@@ -370,22 +573,51 @@ public:
         }
     }
 
+    /**
+     * Run the GRU with zero initial hidden state.
+     * Forwards to `forward(input, nullopt)`.
+     *
+     * @param input Rank-3 sequence.
+     * @return `(output, h_n)`.
+     *
+     * @throws std::invalid_argument if `input` is not rank 3.
+     */
     std::pair<tensor::Tensor<T>, tensor::Tensor<T>>
-    forward(const tensor::Tensor<T>& input) const
-    {
+    forward(const tensor::Tensor<T>& input) const {
         return forward(input, std::nullopt);
     }
 
+    /**
+     * Run the GRU with an explicit initial hidden state.
+     * Wraps `h0` in `optional` and forwards to the three-argument `forward`.
+     *
+     * @param input Rank-3 sequence.
+     * @param h0 Initial hidden `(num_layers * num_directions, N, H)`.
+     * @return `(output, h_n)`.
+     *
+     * @throws std::invalid_argument if `input` is not rank 3.
+     * @throws std::invalid_argument if `h0` cannot be narrowed to each layer's hidden.
+     */
     std::pair<tensor::Tensor<T>, tensor::Tensor<T>>
-    forward(const tensor::Tensor<T>& input, const tensor::Tensor<T>& h0) const
-    {
+    forward(const tensor::Tensor<T>& input, const tensor::Tensor<T>& h0) const {
         return forward(input, std::optional<tensor::Tensor<T>>(h0));
     }
 
+    /**
+     * Unroll the stacked (optionally bidirectional) GRU.
+     * Each layer runs `gru_step` in time; reverse direction concatenates on the feature axis.
+     * Missing `h0` is zeros `{N, H}`.
+     *
+     * @param input Rank-3 sequence `(T, N, F)` or `(N, T, F)` if `batch_first`.
+     * @param h0 Optional initial hidden `(num_layers * num_directions, N, H)`.
+     * @return `(output, h_n)` with `h_n` stacked on dim 0.
+     *
+     * @throws std::invalid_argument if `input` is not rank 3.
+     * @throws std::invalid_argument if `h0` is set but slice indices are out of range.
+     */
     std::pair<tensor::Tensor<T>, tensor::Tensor<T>>
     forward(const tensor::Tensor<T>& input,
-            const std::optional<tensor::Tensor<T>>& h0) const
-    {
+            const std::optional<tensor::Tensor<T>>& h0) const {
         if (input.rank() != 3)
             throw std::invalid_argument("GRU: input must be 3-D");
         const int64_t seq_dim = batch_first_ ? 1 : 0;
@@ -427,17 +659,20 @@ public:
         return {seq, ops::cat(h_n_layers, 0)};
     }
 
-    std::vector<tensor::Tensor<T>*> parameters() override
-    {
-        std::vector<tensor::Tensor<T>*> out;
-        for (auto& c : cells) rnn_detail::collect_cell(out, c);
-        for (auto& c : cells_reverse) rnn_detail::collect_cell(out, c);
+    /**
+     * Collect named weights and biases from forward and reverse cells.
+     * Forward cells use `_l{i}` names; reverse cells use `_l{i}_reverse`.
+     *
+     * @return Named tensors in `cells` then `cells_reverse`.
+     */
+    NamedTensorList<T> named_parameters() override {
+        NamedTensorList<T> out;
+        for (size_t i = 0; i < cells.size(); ++i)
+            rnn_detail::collect_cell_named(out, cells[i], static_cast<int64_t>(i), false);
+        for (size_t i = 0; i < cells_reverse.size(); ++i)
+            rnn_detail::collect_cell_named(out, cells_reverse[i], static_cast<int64_t>(i), true);
         return out;
     }
-
-private:
-    int64_t input_size_, hidden_size_, num_layers_;
-    bool batch_first_, bidirectional_;
 };
 
 } // namespace nn

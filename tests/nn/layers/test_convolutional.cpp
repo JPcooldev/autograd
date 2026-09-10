@@ -1,3 +1,12 @@
+/*
+ * Conv / ConvTranspose layers: init, a numeric 1×1 path, and output ranks.
+ *
+ * - Conv2d kaiming_uniform in ±1/sqrt(fan_in)
+ * - Conv2d 1×1 forward and weight.grad
+ * - Conv1d / Conv3d output ranks
+ * - ConvTranspose2d spatial size; no-bias parameter list
+ */
+
 #include <cmath>
 #include <vector>
 

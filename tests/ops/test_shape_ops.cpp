@@ -1,3 +1,24 @@
+/*
+ * Shape ops: views, packing, cat/narrow, and their backward.
+ *
+ * - transpose rank-2 / rank-3 / negative dims; rank and dim errors
+ * - TransposeBackward is the inverse permute
+ * - reshape and view on contiguous storage
+ * - reshape/flatten pack a transpose; view still throws
+ * - flatten a contiguous axis range
+ * - squeeze all / squeeze(dim) no-op; unsqueeze including on a transpose
+ * - broadcast_to stride 0
+ * - contiguous fast path vs pack; transpose then reshape
+ * - sum of transpose (with and without contiguous) backprops
+ * - narrow view and scatter backward
+ * - cat forward and split backward
+ * - broadcast_to backward (expand axis and prepend rank)
+ * - reshape / flatten / unsqueeze / squeeze-to-scalar backward
+ * - squeeze(dim) no-op stays on the leaf graph
+ * - narrow / cat reject invalid windows and mismatched ranks
+ */
+
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -85,12 +106,19 @@ TEST_CASE("view matches reshape on a contiguous tensor") {
     CHECK(v.data().data() == t.data().data());
 }
 
-TEST_CASE("reshape and flatten reject non-contiguous tensors") {
+TEST_CASE("reshape and flatten pack a non-contiguous tensor; view still throws") {
     const tensor::Tensor<float> t({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, false);
     const auto tr = t.transpose();
 
-    CHECK_THROWS_AS(tr.reshape({6}), std::invalid_argument);
-    CHECK_THROWS_AS(tr.flatten(), std::invalid_argument);
+    const auto r = tr.reshape({6});
+    CHECK(r.shape() == std::vector<int64_t>{6});
+    CHECK(r.data() == std::vector<float>{1.f, 4.f, 2.f, 5.f, 3.f, 6.f});
+
+    const auto f = tr.flatten();
+    CHECK(f.shape() == std::vector<int64_t>{6});
+    CHECK(f.data() == std::vector<float>{1.f, 4.f, 2.f, 5.f, 3.f, 6.f});
+
+    CHECK_THROWS_AS(tr.view({6}), std::invalid_argument);
 }
 
 TEST_CASE("flatten merges a contiguous range of axes") {
@@ -115,7 +143,28 @@ TEST_CASE("unsqueeze inserts a size-1 axis") {
     const auto u = t.unsqueeze(0);
 
     CHECK(u.shape() == std::vector<int64_t>{1, 3});
+    CHECK(u.strides() == std::vector<int64_t>{3, 1});
+    CHECK(u.is_contiguous());
     CHECK(static_cast<float>(u[0][1]) == doctest::Approx(2.f));
+}
+
+TEST_CASE("unsqueeze of a packed matrix keeps C-contiguous strides") {
+    const tensor::Tensor<float> t({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, false);
+    const auto u = t.unsqueeze(0);
+
+    CHECK(u.shape() == std::vector<int64_t>{1, 2, 3});
+    CHECK(u.strides() == std::vector<int64_t>{6, 3, 1});
+    CHECK(u.is_contiguous());
+    CHECK(static_cast<float>(u[0][1][2]) == doctest::Approx(6.f));
+}
+
+TEST_CASE("unsqueeze of a transpose keeps the existing non-contiguous strides") {
+    const tensor::Tensor<float> t({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, false);
+    const auto u = t.transpose(0, 1).unsqueeze(0);
+
+    CHECK(u.shape() == std::vector<int64_t>{1, 3, 2});
+    CHECK(u.strides() == std::vector<int64_t>{3, 1, 3});
+    CHECK_FALSE(u.is_contiguous());
 }
 
 TEST_CASE("broadcast_to expands with stride 0") {
@@ -167,6 +216,15 @@ TEST_CASE("sum of transpose().contiguous() backprops all-ones into the leaf") {
         CHECK(x.grad()->data()[static_cast<size_t>(i)] == doctest::Approx(1.f));
 }
 
+TEST_CASE("sum of a transpose without an explicit contiguous still backprops") {
+    tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, true);
+    x.transpose().sum().backward();
+
+    REQUIRE(x.grad() != nullptr);
+    for (int64_t i = 0; i < 6; ++i)
+        CHECK(x.grad()->data()[static_cast<size_t>(i)] == doctest::Approx(1.f));
+}
+
 TEST_CASE("narrow is a view along dim") {
     const tensor::Tensor<float> t({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, false);
     const auto n = ops::narrow(t, 1, 1, 2);
@@ -202,5 +260,61 @@ TEST_CASE("cat backward splits the gradient") {
     CHECK(a.grad()->data()[0] == doctest::Approx(1.f));
     CHECK(a.grad()->data()[1] == doctest::Approx(1.f));
     CHECK(b.grad()->data()[0] == doctest::Approx(1.f));
+}
+
+TEST_CASE("broadcast_to backward sums the expanded axis") {
+    tensor::Tensor<float> x({1, 3}, std::vector<float>{1.f, 2.f, 3.f}, true);
+    x.broadcast_to({2, 3}).sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->shape() == std::vector<int64_t>{1, 3});
+    CHECK(x.grad()->data() == std::vector<float>{2.f, 2.f, 2.f});
+}
+
+TEST_CASE("broadcast_to prepends a leading dimension and backprops") {
+    tensor::Tensor<float> x({3}, std::vector<float>{1.f, 2.f, 3.f}, true);
+    x.broadcast_to({2, 3}).sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data() == std::vector<float>{2.f, 2.f, 2.f});
+}
+
+TEST_CASE("reshape flatten unsqueeze squeeze backprop onto the leaf") {
+    tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, true);
+    x.reshape({3, 2}).sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    for (float v : x.grad()->data())
+        CHECK(v == doctest::Approx(1.f));
+
+    tensor::Tensor<float> y({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, true);
+    y.flatten().sum().backward();
+    REQUIRE(y.grad() != nullptr);
+    for (float v : y.grad()->data())
+        CHECK(v == doctest::Approx(1.f));
+
+    tensor::Tensor<float> z({3}, std::vector<float>{1.f, 2.f, 3.f}, true);
+    z.unsqueeze(0).sum().backward();
+    REQUIRE(z.grad() != nullptr);
+    CHECK(z.grad()->data() == std::vector<float>{1.f, 1.f, 1.f});
+}
+
+TEST_CASE("squeeze of size-1 tensor to scalar still backprops") {
+    tensor::Tensor<float> x({1}, std::vector<float>{4.f}, true);
+    x.squeeze().exp().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(std::exp(4.f)));
+}
+
+TEST_CASE("squeeze(dim) no-op keeps the leaf on the graph") {
+    tensor::Tensor<float> x({1, 3}, std::vector<float>{1.f, 2.f, 3.f}, true);
+    x.squeeze(1).sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data() == std::vector<float>{1.f, 1.f, 1.f});
+}
+
+TEST_CASE("narrow and cat reject invalid axes") {
+    const tensor::Tensor<float> t({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, false);
+    CHECK_THROWS_AS(ops::narrow(t, 1, 2, 2), std::invalid_argument);
+    const tensor::Tensor<float> a({2, 2}, std::vector<float>{1.f, 2.f, 3.f, 4.f}, false);
+    const tensor::Tensor<float> b({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, false);
+    CHECK_THROWS_AS(ops::cat({a, b}, 0), std::invalid_argument);
 }
 

@@ -13,10 +13,15 @@ namespace autograd {
 
 namespace detail {
 
-// DFS post-order traversal starting from `root`.
-// Each node is visited at most once (cycles are impossible in a DAG).
-// Nodes are pushed onto `order` in post-order, so the front of `order`
-// when reversed is the topological order (root first, leaves last).
+/**
+ * Depth-first post-order walk of the backward DAG from `node`.
+ * Each pointer is inserted into `visited` at most once; nodes are appended to
+ * `order` after their `next_edges` so reversing `order` is output-first topo.
+ *
+ * @param node Current node, or nullptr (ignored).
+ * @param visited Set of already-walked node pointers.
+ * @param order Accumulator filled in post-order (leaves first).
+ */
 template <typename T>
 void topo_dfs(
     Node<T>* node,
@@ -32,29 +37,37 @@ void topo_dfs(
     order.push_back(node);
 }
 
-// Element-wise in-place addition: dst += src.
-// Both tensors must have the same number of elements.
+/**
+ * Add `src` into `dst` element-wise in place (`dst += src`).
+ * Packs `src` to a contiguous buffer, then adds into `dst.data()`.
+ *
+ * @param dst Destination tensor; mutated.
+ * @param src Source tensor; must have the same number of elements as `dst`.
+ */
 template <typename T>
 void accumulate_into(tensor::Tensor<T>& dst, const tensor::Tensor<T>& src) {
+    const auto packed = src.contiguous();
     auto& d = dst.data();
-    const auto& s = src.data();
+    const auto& s = packed.data();
     for (size_t i = 0; i < d.size(); ++i)
         d[i] += s[i];
 }
 
 } // namespace detail
 
-// Execute the backward pass starting from root_fn with the given seed gradient.
-//
-// Algorithm:
-//   1. Topological sort (DFS post-order, then reverse) so we process nodes
-//      from output toward inputs.
-//   2. Maintain an accumulator map: Node* → accumulated gradient Tensor.
-//      Seed it with root_fn → initial_grad.
-//   3. For each node in order: call apply(accumulated_grad), then distribute
-//      the returned per-input gradients to next_edges accumulators.
-//   4. For nullptr edges where the saved input requires grad, accumulate the
-//      gradient directly into the tensor's shared grad buffer (tensor.grad()).
+/**
+ * Run reverse-mode autodiff from `root_fn` with seed gradient `initial_grad`.
+ * Topo-sorts the graph, accumulates per-node output grads, calls `apply`,
+ * and either forwards to the next node or `accumulate_grad`s on requiring-grad
+ * leaves (nullptr edges).
+ *
+ * @param root_fn Backward node of the output tensor.
+ * @param initial_grad Seed gradient for that output (typically ones for a scalar).
+ *
+ * @throws std::invalid_argument if `root_fn` is null.
+ * @throws std::invalid_argument if `initial_grad`'s storage size does not match
+ *         its shape (when copying the seed into the accumulator map).
+ */
 template <typename T>
 void run_backward(
     const std::shared_ptr<Node<T>>& root_fn,
@@ -91,9 +104,9 @@ void run_backward(
                 // Non-leaf: propagate gradient to the next backward node.
                 auto acc_it = accumulators.find(next);
                 if (acc_it == accumulators.end()) {
+                    const auto packed = input_grads[i].contiguous();
                     accumulators.emplace(next,
-                        tensor::Tensor<T>(input_grads[i].shape(),
-                                          input_grads[i].data(), false));
+                        tensor::Tensor<T>(packed.shape(), packed.data(), false));
                 } else {
                     detail::accumulate_into(acc_it->second, input_grads[i]);
                 }

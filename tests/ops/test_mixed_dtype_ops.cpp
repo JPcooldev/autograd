@@ -1,3 +1,18 @@
+/*
+ * Casts (`to<U>`, float32/64, int32/64) and mixed-dtype two-tensor ops.
+ *
+ * - to<double> from float; to<float> from double; to<double> from int32
+ * - to<U> keeps requires_grad only when the destination is floating
+ * - mixed add: float+double, double+float, int32+float, int32+int64
+ * - mixed subtract / multiply / divide promotions
+ * - mixed ops keep the input shape; add throws on mismatch
+ * - mixed dot; mixed matmul both argument orders
+ * - mixed l1, mse, nll, bce
+ * - mixed conv1d with and without bias
+ * - float32 / float64 / int32 / int64 helpers
+ * - to<U> of a transpose packs logical order
+ */
+
 #include <cmath>
 #include <cstdint>
 #include <type_traits>
@@ -180,6 +195,107 @@ TEST_CASE("mixed-dtype add throws on shape mismatch") {
     const tensor::Tensor<float>  a({2}, std::vector<float> {1.0f, 2.0f}, false);
     const tensor::Tensor<double> b({3}, std::vector<double>{1.0, 2.0, 3.0}, false);
     CHECK_THROWS_AS(ops::add(a, b), std::invalid_argument);
+}
+
+// ─── linalg ───────────────────────────────────────────────────────────────────
+
+TEST_CASE("mixed-dtype dot: float · double -> double") {
+    const tensor::Tensor<float>  x({3}, std::vector<float> {1.f, 2.f, 3.f}, false);
+    const tensor::Tensor<double> y({3}, std::vector<double>{4.0, 5.0, 6.0}, false);
+    const auto result = ops::dot(x, y);
+
+    static_assert(std::is_same<decltype(result), const tensor::Tensor<double>>::value);
+    REQUIRE(result.shape() == std::vector<int64_t>{});
+    CHECK(result.data()[0] == doctest::Approx(32.0));
+}
+
+TEST_CASE("mixed-dtype matmul: float @ double -> double") {
+    const tensor::Tensor<float>  A({2, 2}, std::vector<float> {1.f, 2.f, 3.f, 4.f}, false);
+    const tensor::Tensor<double> B({2, 2}, std::vector<double>{5.0, 6.0, 7.0, 8.0}, false);
+    const auto C = ops::matmul(A, B);
+
+    static_assert(std::is_same<decltype(C), const tensor::Tensor<double>>::value);
+    REQUIRE(C.shape() == (std::vector<int64_t>{2, 2}));
+    CHECK(C.data()[0] == doctest::Approx(19.0));
+    CHECK(C.data()[1] == doctest::Approx(22.0));
+    CHECK(C.data()[2] == doctest::Approx(43.0));
+    CHECK(C.data()[3] == doctest::Approx(50.0));
+}
+
+TEST_CASE("mixed-dtype matmul: double @ float -> double (reversed)") {
+    const tensor::Tensor<double> A({2, 2}, std::vector<double>{1.0, 2.0, 3.0, 4.0}, false);
+    const tensor::Tensor<float>  B({2, 2}, std::vector<float> {5.f, 6.f, 7.f, 8.f}, false);
+    const auto C = ops::matmul(A, B);
+
+    static_assert(std::is_same<decltype(C), const tensor::Tensor<double>>::value);
+    CHECK(C.data()[0] == doctest::Approx(19.0));
+    CHECK(C.data()[3] == doctest::Approx(50.0));
+}
+
+// ─── loss ─────────────────────────────────────────────────────────────────────
+
+TEST_CASE("mixed-dtype l1_loss: float vs double, sum reduction") {
+    const tensor::Tensor<float>  input({2}, std::vector<float> {1.f, 3.f}, false);
+    const tensor::Tensor<double> target({2}, std::vector<double>{0.0, 1.0}, false);
+    const auto loss = ops::l1_loss(input, target, false);
+
+    static_assert(std::is_same<decltype(loss), const tensor::Tensor<double>>::value);
+    REQUIRE(loss.shape() == std::vector<int64_t>{});
+    CHECK(loss.data()[0] == doctest::Approx(3.0));
+}
+
+TEST_CASE("mixed-dtype mse_loss: float vs double") {
+    const tensor::Tensor<float>  input({2}, std::vector<float> {1.f, 3.f}, false);
+    const tensor::Tensor<double> target({2}, std::vector<double>{0.0, 1.0}, false);
+    const auto loss = ops::mse_loss(input, target);
+
+    static_assert(std::is_same<decltype(loss), const tensor::Tensor<double>>::value);
+    CHECK(loss.data()[0] == doctest::Approx(2.5));
+}
+
+TEST_CASE("mixed-dtype nll_loss: float vs double, dim=-1") {
+    const tensor::Tensor<float>  input({2}, std::vector<float> {-1.f, -2.f}, false);
+    const tensor::Tensor<double> target({2}, std::vector<double>{1.0, 0.0}, false);
+    const auto loss = ops::nll_loss(input, target, -1);
+
+    static_assert(std::is_same<decltype(loss), const tensor::Tensor<double>>::value);
+    CHECK(loss.data()[0] == doctest::Approx(1.0));
+}
+
+TEST_CASE("mixed-dtype bce_loss: double vs float") {
+    const tensor::Tensor<double> input({2}, std::vector<double>{0.5, 0.5}, false);
+    const tensor::Tensor<float>  target({2}, std::vector<float> {1.f, 0.f}, false);
+    const auto loss = ops::bce_loss(input, target);
+
+    static_assert(std::is_same<decltype(loss), const tensor::Tensor<double>>::value);
+    REQUIRE(loss.shape() == std::vector<int64_t>{});
+    CHECK(loss.data()[0] == doctest::Approx(std::log(2.0)));
+}
+
+// ─── conv ─────────────────────────────────────────────────────────────────────
+
+TEST_CASE("mixed-dtype conv1d: float input, double weight") {
+    const tensor::Tensor<float>  x({1, 1, 3}, std::vector<float> {1.f, 2.f, 3.f}, false);
+    const tensor::Tensor<double> w({1, 1, 1}, std::vector<double>{2.0}, false);
+    const auto y = ops::conv1d(x, w);
+
+    static_assert(std::is_same<decltype(y), const tensor::Tensor<double>>::value);
+    REQUIRE(y.shape() == (std::vector<int64_t>{1, 1, 3}));
+    CHECK(y.data()[0] == doctest::Approx(2.0));
+    CHECK(y.data()[1] == doctest::Approx(4.0));
+    CHECK(y.data()[2] == doctest::Approx(6.0));
+}
+
+TEST_CASE("mixed-dtype conv1d: float input, double weight, double bias") {
+    const tensor::Tensor<float>  x({1, 1, 3}, std::vector<float> {1.f, 2.f, 3.f}, false);
+    const tensor::Tensor<double> w({1, 1, 1}, std::vector<double>{2.0}, false);
+    const tensor::Tensor<double> b({1}, std::vector<double>{1.0}, false);
+    const auto y = ops::conv1d(x, w, &b);
+
+    static_assert(std::is_same<decltype(y), const tensor::Tensor<double>>::value);
+    CHECK(y.data()[0] == doctest::Approx(3.0));
+    CHECK(y.data()[1] == doctest::Approx(5.0));
+    CHECK(y.data()[2] == doctest::Approx(7.0));
 }
 
 // ─── named cast wrappers ──────────────────────────────────────────────────────

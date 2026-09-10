@@ -2,7 +2,7 @@
 
 The autograd system implements **reverse-mode automatic differentiation** (backpropagation) using a dynamically built directed acyclic graph (DAG). The graph is constructed incrementally during the forward pass and consumed once during the backward pass.
 
-Headers live under `src/autograd/`. Always include the library through the umbrella header:
+Headers live under `src/autograd/`. Include the umbrella for tensors, the engine, and core ops:
 
 ```cpp
 #include "autograd/autograd.h"
@@ -18,18 +18,19 @@ Every time an operation runs on tensors that have `requires_grad = true`, the li
 
 1. Computes the forward result (the actual data).
 2. Creates a concrete `Node<T>` subclass for that operation.
-3. Wires the node's `next_edges` to the `grad_fn` (or `AccumulateGrad`) of each input.
-4. Attaches the node to the **output** tensor's `grad_fn_`.
+3. Wires the node's `next_edges` to each input's `grad_fn` (`nullptr` for leaves).
+4. Saves `Tensor::alias(input)` so leaf `GradStorage` is shared with the original tensor.
+5. Attaches the node to the **output** tensor's `grad_fn_`.
 
 The result is a DAG where:
 
 - **Output tensors** (results of ops) point to the node that created them (`grad_fn`).
-- **Leaf tensors** (user-created, `requires_grad = true`) have `grad_fn = nullptr` and instead own an `AccumulateGrad` node that stores the gradient.
-- **Edges** (`next_edges` inside a node) point toward the inputs that contributed to the output.
+- **Leaf tensors** (user-created, `requires_grad = true`) have `grad_fn = nullptr` and own a `GradStorage` box that `.grad()` reads.
+- **Edges** (`next_edges` inside a node) point toward the inputs that contributed to the output. A `nullptr` edge means “this input is a leaf (or no-grad)”.
 
 ```
-leaf x ─── AccumulateGrad ←─── AddBackward ←─── loss.grad_fn
-leaf y ─── AccumulateGrad ←──/
+leaf x  (GradStorage)  <── alias ── AddBackward ←─── loss.grad_fn
+leaf y  (GradStorage)  <── alias ──/
 ```
 
 ### Leaves vs intermediates
@@ -39,7 +40,7 @@ leaf y ─── AccumulateGrad ←──/
 | Created by | User code | An `ops::` function |
 | `grad_fn` | `nullptr` | non-null node |
 | `is_leaf()` | `true` | `false` |
-| Receives gradient | yes (via `AccumulateGrad`) | passed through only |
+| Receives gradient | yes (`accumulate_grad` into `GradStorage`) | passed through only |
 
 ### Gradient accumulation
 
@@ -95,6 +96,11 @@ public:
 
     std::vector<std::shared_ptr<Node<T>>> next_edges;
     std::vector<Tensor<T>>               saved_tensors;
+
+    Node();
+    explicit Node(const Tensor<T>& x);                         // unary
+    Node(const Tensor<T>& x, const Tensor<T>& y);              // binary
+    Node(const Tensor<T>& x, const Tensor<T>& y, const Tensor<T>& z);
 };
 ```
 
@@ -108,7 +114,7 @@ Pointers to the backward nodes of the inputs. The engine follows these edges to 
 
 ### `saved_tensors`
 
-Deep copies of forward tensors that the backward formula needs (e.g. `MultiplyBackward` saves both `x` and `y`). Copies are made at node construction time via `snapshot_tensor`, which creates a plain owning tensor with `requires_grad = false` to avoid reference cycles.
+`Tensor::alias` of the forward inputs (same buffer and, for leaves, the same `GradStorage`). Aliases are not deep copies. There is no `snapshot_tensor` helper.
 
 ### `get_next_edge` (static)
 
@@ -116,27 +122,22 @@ Deep copies of forward tensors that the backward formula needs (e.g. `MultiplyBa
 static std::shared_ptr<Node<T>> get_next_edge(const Tensor<T>& x);
 ```
 
-Returns the correct backward edge for a tensor:
+Returns `x.grad_fn()` for an intermediate tensor, otherwise **`nullptr`** (leaves and no-grad tensors). The engine treats a `nullptr` edge plus a saved alias with `requires_grad` as a leaf and calls `accumulate_grad`.
 
-- If `x` is an intermediate tensor → `x.grad_fn()`
-- If `x` is a leaf with `requires_grad` → `x.ensure_accumulate_grad_fn()` (lazily created)
-- Otherwise → `nullptr`
-
-This is called inside every `ops::` implementation when wiring a new backward node.
+Unary/binary/ternary `Node` constructors reserve, alias each input, and record `get_next_edge` for each.
 
 ---
 
-## `AccumulateGrad<T>`
+## Leaf gradients (`GradStorage`)
 
-**Header:** `src/autograd/accumulate_grad.h`
-
-A terminal node attached to leaf tensors. It has no `next_edges`. Its `apply` either copies the incoming gradient (first call) or accumulates it (`+=`).
+There is **no** `accumulate_grad.h` and no `AccumulateGrad` node. Leaf tensors allocate a `GradStorage` box at construction. `Tensor::accumulate_grad` writes that box; `grad()` returns `GradStorage::tensor.get()` (or `nullptr`). `zero_grad()` nulls the stored tensor but **keeps the box** so later aliases still share it.
 
 ```cpp
-// AccumulateGrad stores a shared_ptr<Tensor<T>> internally.
-// Access via Tensor::grad():
-auto g = x.grad();   // returns shared_ptr<Tensor<T>>, null if not yet computed
+const Tensor<T>* g = x.grad();   // nullptr until the first accumulate
+x.zero_grad();
 ```
+
+Details: [optim/mechanism.md](optim/mechanism.md).
 
 ---
 
@@ -161,9 +162,9 @@ void autograd::run_backward(
 3. **Backward loop** — for each node in topological order:
    - Look up the accumulated gradient for this node.
    - Call `node->apply(accumulated_grad)` → get per-input gradients.
-   - For each `next_edge[i]`: add `input_grads[i]` into that edge's accumulator (creating it if this is the first contribution).
-
-4. **Leaf accumulation** — when the loop reaches an `AccumulateGrad` node, its `apply` stores or adds the gradient into the leaf tensor's `.grad()`.
+   - For each `next_edge[i]`:
+     - If the edge is a node, add `input_grads[i]` into that edge's accumulator.
+     - If the edge is `nullptr` and `saved_tensors[i].requires_grad()`, this is a leaf: `saved_tensors[i].accumulate_grad(input_grads[i])`.
 
 ### Calling `backward`
 
@@ -207,6 +208,12 @@ There is no support for:
 | `TanBackward` | `grad_x = (1 / cos²(saved_x)) * grad` |
 | `SigmoidBackward` | `grad_x = σ(saved_x) * (1 − σ(saved_x)) * grad` |
 | `ReluBackward` | `grad_x = (saved_x > 0) * grad` |
+| `SqrtBackward` | `grad_x = (0.5 / sqrt(saved_x)) * grad` |
+| `SinhBackward` | `grad_x = cosh(saved_x) * grad` |
+| `CoshBackward` | `grad_x = sinh(saved_x) * grad` |
+| `TanhBackward` | `grad_x = (1 − tanh²(saved_x)) * grad` |
+| `SiLUBackward` | `grad_x = (σ + saved_x·σ·(1−σ)) * grad` |
+| `GELUBackward` | Jacobian of the tanh GELU approximation |
 
 ### Shape
 
@@ -221,6 +228,9 @@ There is no support for:
 | `SqueezeBackward` | `grad.reshape(original_shape)` |
 | `UnsqueezeBackward` | `grad.squeeze(dim)` |
 | `CastBackward<Out, In>` | Recast `grad` from `Out` to `In`. Same-type is identity; cross-type bridges into the input graph. |
+| `ContiguousBackward` | Identity on values (layout-only) |
+| `NarrowBackward` | Scatter `grad` into a zeros-like tensor of the original shape |
+| `CatBackward` | Split `grad` along the cat dim and send each slice to the matching input |
 
 `sum_to` is an internal helper that reduces a gradient tensor to a target shape by summing along all dimensions that were broadcast or added.
 
@@ -236,6 +246,8 @@ There is no support for:
 | `MeanDimBackward` | Same as `SumDimBackward` scaled by `1/size(dim)` |
 | `MaxBackward` | One-hot at saved `argmax` position |
 | `MinBackward` | One-hot at saved `argmin` position |
+| `MaxDimBackward` / `MinDimBackward` | Same, along one axis |
+| `SoftmaxBackward` | `dx = s * (g − sum(g·s, dim))` |
 
 ### Linalg
 
@@ -244,9 +256,21 @@ There is no support for:
 | Node | Backward |
 |---|---|
 | `DotBackward` | `grad_a = b * scalar_grad`, `grad_b = a * scalar_grad` |
-| `MatmulBackward` | `grad_A = grad_C @ B^T`, `grad_B = A^T @ grad_C` |
+| `MatmulBackward` | Per batch: `grad_A = grad_C @ B^T`, `grad_B = A^T @ grad_C`; summed over broadcast batch axes |
 
-`MatmulBackward` stores contiguous copies of `A` and `B` at construction time (via an internal `to_contiguous_2d` helper) to ensure the triple-loop backward computation has a guaranteed memory layout.
+`MatmulBackward` stores contiguous copies of `A` and `B` at construction time so the triple-loop backward computation has a guaranteed memory layout.
+
+### Embedding, dropout, conv, pool, loss
+
+| Header | Nodes |
+|---|---|
+| `backward_embedding_ops.h` | `EmbeddingBackward` — scatter-add into weight rows |
+| `backward_dropout_ops.h` | `DropoutBackward` — multiply by saved inverted mask |
+| `backward_conv_ops.h` | `ConvBackward`, `ConvTransposeBackward` |
+| `backward_pool_ops.h` | `MaxPoolBackward` (argmax), `AvgPoolBackward` |
+| `backward_loss_ops.h` | `L1LossBackward`, `L2LossBackward`, `NLLLossBackward`, `CrossEntropyLossBackward`, `BCELossBackward`, `BCEWithLogitsLossBackward`, `KLDivLossBackward` |
+
+Forward formulas and extra arguments: [ops.md](ops.md).
 
 ---
 
@@ -260,19 +284,22 @@ Every new differentiable operation follows the same three-step pattern:
 // src/ops/my_ops.h
 template <typename T>
 tensor::Tensor<T> my_op(const tensor::Tensor<T>& x) {
-    std::vector<T> storage(x.numel());
+    const auto xc = ops::contiguous(x);
+    std::vector<T> storage(static_cast<size_t>(xc.numel()));
     for (size_t i = 0; i < storage.size(); ++i)
-        storage[i] = /* forward formula */;
+        storage[i] = /* forward formula on xc.data()[i] */;
 
     const bool rg = autograd::is_grad_enabled() && x.requires_grad();
     std::shared_ptr<autograd::Node<T>> grad_fn;
     if (rg)
-        grad_fn = std::make_shared<autograd::MyOpBackward<T>>(x);
+        grad_fn = std::make_shared<autograd::MyOpBackward<T>>(xc);
 
     return tensor::Tensor<T>::from_operation_result(
-        x.shape(), std::move(storage), rg, std::move(grad_fn));
+        xc.shape(), std::move(storage), rg, std::move(grad_fn));
 }
 ```
+
+Dense kernels pack first so `data()[i]` is logical order. Already-packed tensors copy nothing. See [tensor/mechanism.md](tensor/mechanism.md#why-dense-kernels-pack-at-the-door).
 
 ### 2. Backward node (`autograd/backward_ops/`)
 

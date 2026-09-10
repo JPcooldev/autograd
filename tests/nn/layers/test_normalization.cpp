@@ -1,3 +1,14 @@
+/*
+ * LayerNorm, RMSNorm, BatchNorm train/eval.
+ *
+ * - LayerNorm γ=1, β=0; last-axis mean ~0 and variance ~1; weight.grad
+ * - RMSNorm has no bias; RMS of output ~1
+ * - BatchNorm1d affine init; running buffers not in parameters()
+ * - train updates running_mean/var; eval uses them (and differs from train)
+ * - BatchNorm2d accepts NCHW
+ */
+
+#include <cmath>
 #include <vector>
 
 #include "../../doctest/doctest.h"
@@ -20,6 +31,9 @@ TEST_CASE("LayerNorm last-dim mean is ~0") {
     CHECK(y.shape() == x.shape());
     const float m0 = (y.data()[0] + y.data()[1] + y.data()[2]) / 3.f;
     CHECK(m0 == doctest::Approx(0.f).epsilon(1e-5));
+    const float v0 = (y.data()[0] * y.data()[0] + y.data()[1] * y.data()[1]
+                    + y.data()[2] * y.data()[2]) / 3.f;
+    CHECK(v0 == doctest::Approx(1.f).epsilon(1e-4));
     y.sum().backward();
     REQUIRE(ln.weight.grad() != nullptr);
 }
@@ -31,6 +45,10 @@ TEST_CASE("RMSNorm has no bias and ones weight") {
         CHECK(v == doctest::Approx(1.f));
     tensor::Tensor<float> x({1, 3}, std::vector<float>{1.f, 2.f, 2.f}, false);
     CHECK(rms.forward(x).shape() == std::vector<int64_t>{1, 3});
+    auto y = rms.forward(x);
+    const float ms = (y.data()[0] * y.data()[0] + y.data()[1] * y.data()[1]
+                    + y.data()[2] * y.data()[2]) / 3.f;
+    CHECK(ms == doctest::Approx(1.f).epsilon(1e-4));
 }
 
 TEST_CASE("BatchNorm1d affine ones/zeros and running buffers not in parameters") {
@@ -50,12 +68,17 @@ TEST_CASE("BatchNorm1d train updates running stats; eval uses them") {
     bn.train();
     auto y = bn.forward(x);
     CHECK(y.shape() == x.shape());
-    CHECK(bn.running_mean.data()[0] != doctest::Approx(0.f));
-    const float rm = bn.running_mean.data()[0];
+    CHECK(bn.running_mean.data()[0] == doctest::Approx(0.4f));
+    CHECK(bn.running_var.data()[0] == doctest::Approx(1.4f));
+    const float train0 = y.data()[0];
     bn.eval();
     auto y_eval = bn.forward(x);
     CHECK(y_eval.shape() == x.shape());
-    CHECK(bn.running_mean.data()[0] == doctest::Approx(rm));
+    CHECK(bn.running_mean.data()[0] == doctest::Approx(0.4f));
+    const float denom = std::sqrt(1.4f + 1e-5f);
+    CHECK(y_eval.data()[0] == doctest::Approx((1.f - 0.4f) / denom));
+    CHECK(y_eval.data()[3] == doctest::Approx((7.f - 0.4f) / denom));
+    CHECK(y_eval.data()[0] != doctest::Approx(train0));
     y.sum().backward();
     REQUIRE(bn.weight.grad() != nullptr);
 }

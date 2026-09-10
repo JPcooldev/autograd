@@ -23,6 +23,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Usage: $0 [-v] [-n <file> [<file> ...]]" >&2
+            echo "  compiler: CXX (default g++-14), e.g. CXX=clang++ $0" >&2
             exit 1
             ;;
     esac
@@ -34,7 +35,10 @@ fi
 
 mkdir -p "$BUILD_DIR"
 
-g++-14 -std=c++17 -Wall -Wextra -pedantic \
+CXX="${CXX:-g++-14}"
+echo "compiling tests with $CXX -std=c++17 -O2"
+
+"$CXX" -std=c++17 -O2 -Wall -Wextra -pedantic \
     -I "$REPO_ROOT/src" \
     "$REPO_ROOT/tests/test_main.cpp" \
     "${TEST_FILES[@]}" \

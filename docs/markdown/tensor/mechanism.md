@@ -73,23 +73,21 @@ Example: `[2, 3, 4] → [12, 4, 1]`.
 
 `is_contiguous()` checks that `strides_ == compute_contiguous_strides(shape_)`. It does **not** require `offset_ == 0`. A packed slice can still sit at a non-zero offset.
 
-Most elementwise and reduction kernels loop `data()[i]` for `i in 0 .. numel()`. That is correct only when the tensor is contiguous **and** `offset() == 0`. `matmul` is the exception: it reads `offset + i*s0 + k*s1`.
-
-That is why `contiguous()` exists.
+Most elementwise and reduction kernels loop `data()[i]` for `i in 0 .. numel()`. They call `contiguous()` at the start so that is valid (see [Why dense kernels pack at the door](#why-dense-kernels-pack-at-the-door)). `matmul` is the exception: it reads through the full stride formula on the last two (matrix) axes and on broadcast batch axes.
 
 ## When memory is allocated
 
 | Path | Allocates a new `vector<T>`? |
 | --- | --- |
-| Constructors, `zeros` / `ones` / `full` / random / Xavier / Kaiming | Yes |
+| Constructors, `zeros` / `ones` / `full` / `arange` / random / Xavier / Kaiming / `uniform` | Yes |
 | `from_operation_result` (add, relu, sum, `to()`, …) | Yes — the op writes a dense result |
-| `from_view` (`transpose`, `reshape`, `view`, `flatten`, `squeeze`, `unsqueeze`, `broadcast_to`) | No |
+| `from_view` (`transpose`, `reshape`, `view`, `flatten`, `squeeze`, `unsqueeze`, `broadcast_to`, `narrow`) | No |
 | `alias` | No |
 | Copy / move of a `Tensor` handle | No |
 | `contiguous()` of a packed tensor (`is_contiguous() && offset() == 0`) | No — returns `*this` |
 | `contiguous()` of a strided view (e.g. after `transpose`) | Yes — gather via the stride formula |
 
-`reshape` / `view` / `flatten` refuse non-contiguous inputs: they only rewrite shape and contiguous strides, they do not gather. Call `contiguous()` first.
+`reshape` packs a non-contiguous source then installs `compute_contiguous_strides(new_shape)`. `view` refuses non-contiguous inputs (never copies). `flatten` packs if needed, then installs contiguous strides at the same `offset_`.
 
 ## Shape ops and strides
 
@@ -97,7 +95,7 @@ That is why `contiguous()` exists.
 
 **broadcast_to** prepends or expands size-1 axes by setting **stride 0**. Advancing that axis does not move the pointer, so the same element is reused. No replication in RAM.
 
-**reshape / view / flatten** require contiguity, then install `compute_contiguous_strides(new_shape)` at the same `offset_`.
+**reshape** packs if the source is not contiguous, then installs `compute_contiguous_strides(new_shape)` at the (possibly copied) `offset_`. **view** is the same rewrite but throws instead of packing. **flatten** packs if needed, then merges a range of axes.
 
 **squeeze** drops size-1 axes and their strides (valid on non-contiguous tensors). **unsqueeze** inserts a size-1 axis; the new stride is the next axis’s stride (or `1` at the end).
 
@@ -131,8 +129,18 @@ leaf [2, 3]  --transpose-->  view [3, 2]  --contiguous-->  packed [3, 2]
 
 Only **leaves** with `requires_grad == true` own a `GradStorage`. Op results have `grad_fn` and `grad_storage_ == nullptr`; their gradient lives in the engine map for one `backward()`. `zero_grad()` nulls `GradStorage::tensor` but keeps the box so the next forward’s aliases still share it. Integer tensors never get a box (`grad_allowed` is false).
 
-## Kernel constraint (honest)
+## Why dense kernels pack at the door
 
-This design is efficient for **views**: transpose, broadcast, and squeeze are metadata. It is not yet efficient for **math on those views**. `add`, `relu`, `sum`, … index the raw buffer densely. `matmul` respects strides.
+`data()` is the raw `vector<T>`. `data()[i]` is storage order, not logical order. Shape ops only rewrite strides, so a dense `for i: out[i] = f(x.data()[i])` is wrong on a transpose (and would sum the wrong buffer on `narrow` / `broadcast_to`).
 
-Practical rule: run dense math on packed tensors, or call `contiguous()` after a strided view. `operator[]` is always stride-correct, so it is the right way to inspect a view in tests.
+Three ways to make math correct on views:
+
+| Approach | What it does | Why not (or when) |
+| --- | --- | --- |
+| **Strided container around the buffer** so `data()[i]` means logical `i` | Extra object (`tensor → container → vector`). `[]` is still a gather. SIMD wants sequential loads, not a wrapper. This library has no separate Storage type on purpose. | Rejected |
+| **Stride-aware access in every kernel** (`offset + sum(idx * stride)`) | Correct in one pass, no extra buffer. The inner loop is a gather. Compilers rarely auto-vectorize that; `-O2` vectorizes `p[i] + q[i]`, not index decoding. | Used only in `matmul`, which fuses the gather with the multiply |
+| **Pack at the start of dense kernels** (`contiguous()`, then `data()[i]`) | **Chosen.** Kernels stay one dense loop. Already-packed tensors (the common case) copy nothing and vectorize. A view is gathered once, then the same SIMD loop. Backward nodes save the packed tensors. Compile with **`-O2` or `-O3`** so that loop actually SIMD-vectorizes; `-O0` still packs, but the inner loop stays scalar. | |
+
+Do **not** pack at the end of every shape op. `broadcast_to` of `[1, 3]` to `[1e6, 3]` is metadata (stride 0). Materializing it would allocate millions of elements. `transpose` then `matmul` would copy a matrix `matmul` can already read through strides.
+
+Practical rule: leave shape ops as views; packing happens when you run dense math, or when `reshape` cannot be a view. `operator[]` is always stride-correct, so it is the right way to inspect a view in tests.

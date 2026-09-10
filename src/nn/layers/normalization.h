@@ -15,18 +15,31 @@ namespace nn {
 
 namespace norm_detail {
 
+/**
+ * Broadcast a rank-1 feature vector onto `like`.
+ * Unsqueeze leading dims until ranks match, then `broadcast_to(like.shape())` and `contiguous()`.
+ *
+ * @param feat Feature tensor, typically shape `{C}`.
+ * @param like Tensor whose shape is the broadcast target.
+ * @return `feat` broadcast and made contiguous at `like`'s shape.
+ */
 template <typename T>
-tensor::Tensor<T> broadcast_feature(const tensor::Tensor<T>& feat, const tensor::Tensor<T>& like)
-{
+tensor::Tensor<T> broadcast_feature(const tensor::Tensor<T>& feat, const tensor::Tensor<T>& like) {
     auto t = feat;
     while (t.rank() < like.rank())
         t = t.unsqueeze(0);
     return t.broadcast_to(like.shape()).contiguous();
 }
 
+/**
+ * Repeat the last-axis mean of `x` back to `x`'s shape.
+ * Computes `x.mean(-1)`, unsqueezes the last dim, broadcasts, and copies to contiguous storage.
+ *
+ * @param x Input tensor with rank ≥ 1.
+ * @return Tensor with the same shape as `x`, each position holding the mean of its last-axis slice.
+ */
 template <typename T>
-tensor::Tensor<T> last_dim_mean(const tensor::Tensor<T>& x)
-{
+tensor::Tensor<T> last_dim_mean(const tensor::Tensor<T>& x) {
     return x.mean(-1).unsqueeze(-1).broadcast_to(x.shape()).contiguous();
 }
 
@@ -35,20 +48,38 @@ tensor::Tensor<T> last_dim_mean(const tensor::Tensor<T>& x)
 // y = (x - μ) / sqrt(σ² + ε) * γ + β   over the last axis
 template <typename T>
 class LayerNorm : public Layer<T> {
+private:
+    int64_t num_features_;
+
 public:
     tensor::Tensor<T> weight;
     tensor::Tensor<T> bias;
     double eps;
 
+    /**
+     * Construct last-axis LayerNorm.
+     * Initializes `weight` (γ) to ones and `bias` (β) to zeros, both shape `{num_features}` with `requires_grad`.
+     *
+     * @param num_features Size of the last dimension of `forward` inputs.
+     * @param eps_ Denominator stabilizer ε. Default 1e-5.
+     */
     LayerNorm(int64_t num_features, double eps_ = 1e-5)
-        : weight(tensor::Tensor<T>::ones({num_features}, true)),
+        : num_features_(num_features),
+          weight(tensor::Tensor<T>::ones({num_features}, true)),
           bias(tensor::Tensor<T>::zeros({num_features}, true)),
-          eps(eps_),
-          num_features_(num_features)
-    {}
+          eps(eps_) {}
 
-    tensor::Tensor<T> forward(const tensor::Tensor<T>& input) const
-    {
+    /**
+     * Apply affine LayerNorm over the last axis: `(x-μ)/√(σ²+ε) * γ + β`.
+     * Uses batch-independent mean/var along the last dimension; `weight` and `bias` are broadcast to `x`.
+     *
+     * @param input Tensor of shape `(..., num_features)`.
+     * @return Normalized tensor of the same shape.
+     *
+     * @throws std::invalid_argument if `input.rank() < 1`.
+     * @throws std::invalid_argument if the last dimension is not `num_features`.
+     */
+    tensor::Tensor<T> forward(const tensor::Tensor<T>& input) const {
         if (input.rank() < 1)
             throw std::invalid_argument("LayerNorm: input rank must be >= 1");
         if (input.shape().back() != num_features_)
@@ -65,27 +96,49 @@ public:
             norm_detail::broadcast_feature(bias, y));
     }
 
-    std::vector<tensor::Tensor<T>*> parameters() override { return {&weight, &bias}; }
-
-private:
-    int64_t num_features_;
+    /**
+     * Return named pointers to γ and β.
+     *
+     * @return `{{"weight", &weight}, {"bias", &bias}}`.
+     */
+    NamedTensorList<T> named_parameters() override {
+        return {{"weight", &weight}, {"bias", &bias}};
+    }
 };
 
 // y = x / sqrt(mean(x²) + ε) * γ
 template <typename T>
 class RMSNorm : public Layer<T> {
+private:
+    int64_t num_features_;
+
 public:
     tensor::Tensor<T> weight;
     double eps;
 
+    /**
+     * Construct last-axis RMSNorm.
+     * Initializes `weight` (γ) to ones of shape `{num_features}` with `requires_grad`. No bias.
+     *
+     * @param num_features Size of the last dimension of `forward` inputs.
+     * @param eps_ Denominator stabilizer ε. Default 1e-5.
+     */
     RMSNorm(int64_t num_features, double eps_ = 1e-5)
-        : weight(tensor::Tensor<T>::ones({num_features}, true)),
-          eps(eps_),
-          num_features_(num_features)
-    {}
+        : num_features_(num_features),
+          weight(tensor::Tensor<T>::ones({num_features}, true)),
+          eps(eps_) {}
 
-    tensor::Tensor<T> forward(const tensor::Tensor<T>& input) const
-    {
+    /**
+     * Apply RMSNorm over the last axis: `x / √(mean(x²)+ε) * γ`.
+     * `weight` is broadcast to the normalized tensor.
+     *
+     * @param input Tensor of shape `(..., num_features)`.
+     * @return Normalized tensor of the same shape.
+     *
+     * @throws std::invalid_argument if `input.rank() < 1`.
+     * @throws std::invalid_argument if the last dimension is not `num_features`.
+     */
+    tensor::Tensor<T> forward(const tensor::Tensor<T>& input) const {
         if (input.rank() < 1)
             throw std::invalid_argument("RMSNorm: input rank must be >= 1");
         if (input.shape().back() != num_features_)
@@ -98,14 +151,19 @@ public:
         return ops::multiply(y, norm_detail::broadcast_feature(weight, y));
     }
 
-    std::vector<tensor::Tensor<T>*> parameters() override { return {&weight}; }
-
-private:
-    int64_t num_features_;
+    /**
+     * Return a named pointer to γ.
+     *
+     * @return `{{"weight", &weight}}`.
+     */
+    NamedTensorList<T> named_parameters() override { return {{"weight", &weight}}; }
 };
 
 template <typename T>
 class BatchNorm : public Layer<T> {
+private:
+    int64_t num_features_;
+
 public:
     tensor::Tensor<T> weight;
     tensor::Tensor<T> bias;
@@ -114,18 +172,36 @@ public:
     double eps;
     double momentum;
 
+    /**
+     * Construct channel-axis batch normalization (dim 1).
+     * Initializes γ to ones, β to zeros (`requires_grad`); running mean to zeros and running var
+     * to ones (`requires_grad=false`).
+     *
+     * @param num_features Channel count C (input dim 1).
+     * @param eps_ Denominator stabilizer ε. Default 1e-5.
+     * @param momentum_ Factor m for `running = (1-m)·running + m·batch` in training. Default 0.1.
+     */
     BatchNorm(int64_t num_features, double eps_ = 1e-5, double momentum_ = 0.1)
-        : weight(tensor::Tensor<T>::ones({num_features}, true)),
+        : num_features_(num_features),
+          weight(tensor::Tensor<T>::ones({num_features}, true)),
           bias(tensor::Tensor<T>::zeros({num_features}, true)),
           running_mean(tensor::Tensor<T>::zeros({num_features}, false)),
           running_var(tensor::Tensor<T>::ones({num_features}, false)),
           eps(eps_),
-          momentum(momentum_),
-          num_features_(num_features)
-    {}
+          momentum(momentum_) {}
 
-    tensor::Tensor<T> forward(const tensor::Tensor<T>& input)
-    {
+    /**
+     * Normalize over all axes except channel dim 1, then apply affine γ, β.
+     * Training: uses batch mean/var and updates running stats with `momentum`.
+     * Eval: uses `running_mean` / `running_var` only. Non-const because running buffers are written in train.
+     *
+     * @param input Tensor of shape `(N, C, ...)` with `C == num_features`.
+     * @return Normalized tensor of the same shape.
+     *
+     * @throws std::invalid_argument if `input.rank() < 2`.
+     * @throws std::invalid_argument if dim 1 is not `num_features`.
+     */
+    tensor::Tensor<T> forward(const tensor::Tensor<T>& input) {
         if (input.rank() < 2)
             throw std::invalid_argument("BatchNorm: expected (N, C, ...)");
         if (input.shape()[1] != num_features_)
@@ -181,27 +257,52 @@ public:
             b.broadcast_to(x.shape()).contiguous());
     }
 
-    std::vector<tensor::Tensor<T>*> parameters() override { return {&weight, &bias}; }
+    /**
+     * Return named pointers to γ and β (not running buffers).
+     *
+     * @return `{{"weight", &weight}, {"bias", &bias}}`.
+     */
+    NamedTensorList<T> named_parameters() override {
+        return {{"weight", &weight}, {"bias", &bias}};
+    }
 
-private:
-    int64_t num_features_;
+    /**
+     * Return named running statistics used at eval time.
+     *
+     * @return `{{"running_mean", &running_mean}, {"running_var", &running_var}}`.
+     */
+    NamedTensorList<T> named_buffers() override {
+        return {{"running_mean", &running_mean}, {"running_var", &running_var}};
+    }
 };
 
 template <typename T>
 class BatchNorm1d : public BatchNorm<T> {
 public:
+    /**
+     * Inherit `BatchNorm` constructors (`num_features`, `eps=1e-5`, `momentum=0.1`).
+     * Same forward as `BatchNorm` for `(N, C)` or `(N, C, L)`.
+     */
     using BatchNorm<T>::BatchNorm;
 };
 
 template <typename T>
 class BatchNorm2d : public BatchNorm<T> {
 public:
+    /**
+     * Inherit `BatchNorm` constructors (`num_features`, `eps=1e-5`, `momentum=0.1`).
+     * Same forward as `BatchNorm` for `(N, C, H, W)`.
+     */
     using BatchNorm<T>::BatchNorm;
 };
 
 template <typename T>
 class BatchNorm3d : public BatchNorm<T> {
 public:
+    /**
+     * Inherit `BatchNorm` constructors (`num_features`, `eps=1e-5`, `momentum=0.1`).
+     * Same forward as `BatchNorm` for `(N, C, D, H, W)`.
+     */
     using BatchNorm<T>::BatchNorm;
 };
 

@@ -3,3 +3,6 @@
 .cursor/
 build/
 doctest-docs/
+data-example/
+CONCEPT.md
+NOTES.md

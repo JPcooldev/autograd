@@ -6,7 +6,9 @@ How `nn::Layer` / `nn::Module` own parameters, how those leaves stay alive for `
 
 A **layer** is a `nn::Layer<T>` with its own `forward` signature and a `parameters()` list of **leaf** tensors (`requires_grad == true`, `grad_fn == nullptr`). There is no virtual `forward` on the base: Python `nn.Module` does the same, and it is the only way to express loss `(input, target)`, RNN `(output, h_n)`, and mutating Dropout / BatchNorm.
 
-A **module** is a `nn::Module<T>` — a layer that also holds named sub-layers. Because C++ has no `__setattr__` hook, you `register_module` (and optionally `register_parameter`) in the constructor. `parameters()` walks `own_params_` then every registered child, depth-first.
+A **module** is a `nn::Module<T>` — a layer that also holds named sub-layers. Because C++ has no `__setattr__` hook, you `register_module` (and optionally `register_parameter` / `register_buffer`) in the constructor. `parameters()` walks `own_params_` then every registered child, depth-first. `num_parameters()` sums `numel()` over that list. `Module::zero_grad()` clears grads on those tensors.
+
+Signatures: [reference.md](reference.md#module--layer).
 
 ```text
 Module
@@ -18,6 +20,26 @@ Module
 ```
 
 `Linear` / `Conv*` / RNN cells keep `weight` and `bias` as **public members** that are those leaves. Forward ops receive `Tensor::alias` of them (see below), so the graph does not copy the buffers.
+
+## Named parameters, buffers, and checkpoints
+
+`parameters()` is an unnamed pointer list for the optimizer. Names live on `named_parameters()` / `named_buffers()` so a checkpoint can store **structure + values** and refuse to load into the wrong architecture.
+
+Leaf names are local (`weight`, `bias`, `running_mean`, `weight_ih_l0`, …). `register_module("fc1", fc1)` prefixes children: `fc1.weight`. `register_parameter` / `register_buffer` do the same for bare tensors on a `Module`. Duplicate names at one module level throw.
+
+`state_dict()` is parameters then buffers. `nn::save` / `nn::load` (`src/nn/serialize.h`) write an **AGCK** file: magic, version, then each tensor as name, dtype, shape, `requires_grad`, parameter-vs-buffer flag, and packed row-major values (`Tensor::to_vector()`). Strides and views are not stored.
+
+`nn::load` builds the same named list on the **already constructed** model, matches by name, and checks shape / dtype / flags. On success it `copy_`s into the existing tensors so optimizer pointers and `GradStorage` stay valid. In **strict** mode (default) a missing key, extra key, or metadata mismatch throws a combined `state_dict` error. `load(model, path, /*strict=*/false)` copies matching keys and skips the rest (warnings when logging is on). Shape/dtype mismatches still throw.
+
+```cpp
+#include "nn/serialize.h"
+
+nn::save(model, "mlp.agck");
+MLP other;
+nn::load(other, "mlp.agck");  // throws if other was built with a different width
+```
+
+BatchNorm `running_mean` / `running_var` are buffers: they are saved even though they are not in `parameters()`.
 
 ## `Tensor::alias` and graph lifetime
 
@@ -91,11 +113,11 @@ Because each `matmul` node aliases those leaves, `weight.grad()` after `output.s
 
 Default layout is seq-first `(T, N, F)` like `torch.nn.RNN`. `batch_first=true` uses `(N, T, F)`. Bidirectional runs a second cell in reverse and `cat`s on the feature axis. `num_layers > 1` stacks; there is no inter-layer dropout (use `nn::Dropout` yourself).
 
-`h0` default is zeros with `requires_grad=false`. LSTM also carries `c_n`.
+`h0` default is zeros with `requires_grad=false`. LSTM also carries `c_n`. LSTM `forward` overloads: `forward(input)`, `forward(input, h0)`, `forward(input, optional h0, optional c0)`.
 
 ## Dropout mask
 
-Inverted dropout: in `training()`, each element is kept with probability `1-p` and **multiplied by `1/(1-p)`**. The mask is sampled inside `ops::dropout` (there is no public `bernoulli` factory) and saved on the backward node. `eval()` or `p == 0` returns the input unchanged (identity, no node).
+Inverted dropout: in `training()`, each element is kept with probability `1-p` and **multiplied by `1/(1-p)`**. The mask is sampled inside `ops::dropout(x, p, training, seed)` (there is no public `bernoulli` factory) and saved on the backward node. `eval()` or `p == 0` returns the input unchanged (identity, no node). The free function's optional `seed` is for tests; the layer does not pass a seed.
 
 ## BatchNorm running stats vs affine parameters
 

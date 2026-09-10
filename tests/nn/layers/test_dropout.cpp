@@ -1,3 +1,15 @@
+/*
+ * nn::Dropout: eval identity, p=0, train/eval recurse, train actually drops.
+ *
+ * - eval is identity
+ * - p=0 in train is identity (and backward)
+ * - Module train/eval recurses into Dropout
+ * - p outside [0, 1) throws
+ * - train with high p zeros some elements and scales survivors
+ */
+
+#include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include "../../doctest/doctest.h"
@@ -36,4 +48,26 @@ TEST_CASE("Module train/eval recurses into Dropout") {
     CHECK_FALSE(m.drop.training());
     m.train();
     CHECK(m.drop.training());
+}
+
+TEST_CASE("Dropout p outside [0, 1) throws") {
+    CHECK_THROWS_AS(nn::Dropout<float>(-0.1), std::invalid_argument);
+    CHECK_THROWS_AS(nn::Dropout<float>(1.0), std::invalid_argument);
+}
+
+TEST_CASE("Dropout train with high p zeros some elements") {
+    nn::Dropout<float> drop(0.9);
+    drop.train();
+    tensor::Tensor<float> x({64}, std::vector<float>(64, 1.f), false);
+    const auto y = drop.forward(x);
+    int zeros = 0;
+    int scaled = 0;
+    for (float v : y.data()) {
+        if (v == 0.f)
+            ++zeros;
+        else if (std::abs(v - (1.f / 0.1f)) < 1e-4f)
+            ++scaled;
+    }
+    CHECK(zeros + scaled == 64);
+    CHECK(zeros > 0);
 }

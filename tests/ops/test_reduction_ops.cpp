@@ -1,3 +1,20 @@
+/*
+ * Reductions: sum, mean, max, min, softmax — forward, dim, and backward.
+ *
+ * - sum: 1-D / 2-D / single element; empty throw; no-grad; SumBackward node
+ * - SumBackward broadcasts a scalar uniformly
+ * - sum(dim): rows, cols, negative axis, 3-D middle, rank-1 → scalar
+ * - sum(dim) throws on scalar and OOB dim; SumDimBackward
+ * - mean global and MeanBackward 1/numel
+ * - mean(dim): rows, cols, negative axis; scalar / empty-dim throw; MeanDimBackward
+ * - max/min global; empty throw; scatter to argmax/argmin; first-tie
+ * - max/min(dim): 2-D, negative, 3-D, rank-1; scalar / OOB / empty-dim throw
+ * - MaxDim/MinDim backward and first-tie along dim
+ * - no grad_fn when inputs are no-grad; next_edge wiring
+ * - softmax last axis, non-last axis, JVP formula
+ * - sum of transpose / broadcast / narrow uses logical elements
+ */
+
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -240,6 +257,11 @@ TEST_CASE("mean(dim) throws on scalar tensor") {
     CHECK_THROWS_AS(x.mean(0), std::invalid_argument);
 }
 
+TEST_CASE("mean(dim) throws on empty reduced dimension") {
+    const tensor::Tensor<float> x({2, 0}, false);
+    CHECK_THROWS_AS(x.mean(1), std::invalid_argument);
+}
+
 TEST_CASE("MeanDimBackward distributes grad as 1/dim_size along reduced axis") {
     // [[1,2,3],[4,5,6]], mean(dim=0) -> [2.5, 3.5, 4.5]
     // backward with grad [1,1,1]: each input element gets 1/2 = 0.5
@@ -346,6 +368,212 @@ TEST_CASE("MinBackward passes grad only to the argmin position") {
     CHECK(grads[0].data()[3] == doctest::Approx(0.f));
 }
 
+TEST_CASE("MinBackward on tie picks first occurrence") {
+    const tensor::Tensor<float> x({4}, std::vector<float>{2.f, 2.f, 2.f, 2.f}, true);
+    const auto result = x.min();
+    const tensor::Tensor<float> propagated({}, std::vector<float>{1.f}, false);
+    const auto grads = result.grad_fn()->apply(propagated);
+    CHECK(grads[0].data()[0] == doctest::Approx(1.f));
+    CHECK(grads[0].data()[1] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[2] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[3] == doctest::Approx(0.f));
+}
+
+// ─── max(dim) ─────────────────────────────────────────────────────────────────
+
+TEST_CASE("max(dim=0) on 2-D tensor reduces rows") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 5.f, 3.f, 4.f, 2.f, 6.f}, false);
+    const auto result = x.max(0);
+
+    CHECK(result.shape() == std::vector<int64_t>{3});
+    CHECK(result.data()[0] == doctest::Approx(4.f));
+    CHECK(result.data()[1] == doctest::Approx(5.f));
+    CHECK(result.data()[2] == doctest::Approx(6.f));
+}
+
+TEST_CASE("max(dim=1) on 2-D tensor reduces columns") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 5.f, 3.f, 4.f, 2.f, 6.f}, false);
+    const auto result = x.max(1);
+
+    CHECK(result.shape() == std::vector<int64_t>{2});
+    CHECK(result.data()[0] == doctest::Approx(5.f));
+    CHECK(result.data()[1] == doctest::Approx(6.f));
+}
+
+TEST_CASE("max(dim) supports negative dimension index") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 5.f, 3.f, 4.f, 2.f, 6.f}, false);
+    const auto pos = x.max(1);
+    const auto neg = x.max(-1);
+    REQUIRE(pos.shape() == neg.shape());
+    for (size_t i = 0; i < static_cast<size_t>(pos.numel()); ++i)
+        CHECK(pos.data()[i] == doctest::Approx(neg.data()[i]));
+}
+
+TEST_CASE("max(dim=1) on 3-D tensor reduces middle axis") {
+    const tensor::Tensor<float> x(
+        {2, 3, 2},
+        std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f, 9.f, 10.f, 11.f, 12.f},
+        false);
+    const auto result = x.max(1);
+
+    CHECK(result.shape() == (std::vector<int64_t>{2, 2}));
+    CHECK(result.data()[0] == doctest::Approx(5.f));
+    CHECK(result.data()[1] == doctest::Approx(6.f));
+    CHECK(result.data()[2] == doctest::Approx(11.f));
+    CHECK(result.data()[3] == doctest::Approx(12.f));
+}
+
+TEST_CASE("max(dim) on rank-1 tensor produces scalar shape") {
+    const tensor::Tensor<float> x({4}, std::vector<float>{3.f, 1.f, 4.f, 2.f}, false);
+    const auto result = x.max(0);
+    CHECK(result.shape() == std::vector<int64_t>{});
+    CHECK(result.data()[0] == doctest::Approx(4.f));
+}
+
+TEST_CASE("max(dim) throws on scalar tensor") {
+    const tensor::Tensor<float> x({}, false);
+    CHECK_THROWS_AS(x.max(0), std::invalid_argument);
+}
+
+TEST_CASE("max(dim) throws on out-of-range dimension") {
+    const tensor::Tensor<float> x({2, 3}, false);
+    CHECK_THROWS_AS(x.max(2), std::out_of_range);
+    CHECK_THROWS_AS(x.max(-3), std::out_of_range);
+}
+
+TEST_CASE("max(dim) throws on empty reduced dimension") {
+    const tensor::Tensor<float> x({2, 0}, false);
+    CHECK_THROWS_AS(x.max(1), std::invalid_argument);
+}
+
+TEST_CASE("MaxDimBackward scatters grad to the argmax along dim") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 5.f, 3.f, 4.f, 2.f, 6.f}, true);
+    const auto result = x.max(0);
+    REQUIRE(result.grad_fn().get() != nullptr);
+
+    const tensor::Tensor<float> propagated({3}, std::vector<float>{10.f, 20.f, 30.f}, false);
+    const auto grads = result.grad_fn()->apply(propagated);
+
+    REQUIRE(grads.size() == 1);
+    REQUIRE(grads[0].shape() == (std::vector<int64_t>{2, 3}));
+    CHECK(grads[0].data()[0] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[1] == doctest::Approx(20.f));
+    CHECK(grads[0].data()[2] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[3] == doctest::Approx(10.f));
+    CHECK(grads[0].data()[4] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[5] == doctest::Approx(30.f));
+}
+
+TEST_CASE("MaxDimBackward on tie picks first occurrence along dim") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{5.f, 1.f, 3.f, 5.f, 2.f, 3.f}, true);
+    const auto result = x.max(0);
+    const tensor::Tensor<float> propagated({3}, std::vector<float>{1.f, 1.f, 1.f}, false);
+    const auto grads = result.grad_fn()->apply(propagated);
+
+    CHECK(grads[0].data()[0] == doctest::Approx(1.f));
+    CHECK(grads[0].data()[1] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[2] == doctest::Approx(1.f));
+    CHECK(grads[0].data()[3] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[4] == doctest::Approx(1.f));
+    CHECK(grads[0].data()[5] == doctest::Approx(0.f));
+}
+
+// ─── min(dim) ─────────────────────────────────────────────────────────────────
+
+TEST_CASE("min(dim=0) on 2-D tensor reduces rows") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 5.f, 3.f, 4.f, 2.f, 6.f}, false);
+    const auto result = x.min(0);
+
+    CHECK(result.shape() == std::vector<int64_t>{3});
+    CHECK(result.data()[0] == doctest::Approx(1.f));
+    CHECK(result.data()[1] == doctest::Approx(2.f));
+    CHECK(result.data()[2] == doctest::Approx(3.f));
+}
+
+TEST_CASE("min(dim=1) on 2-D tensor reduces columns") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 5.f, 3.f, 4.f, 2.f, 6.f}, false);
+    const auto result = x.min(1);
+
+    CHECK(result.shape() == std::vector<int64_t>{2});
+    CHECK(result.data()[0] == doctest::Approx(1.f));
+    CHECK(result.data()[1] == doctest::Approx(2.f));
+}
+
+TEST_CASE("min(dim) supports negative dimension index") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 5.f, 3.f, 4.f, 2.f, 6.f}, false);
+    CHECK(x.min(-1).data()[0] == doctest::Approx(x.min(1).data()[0]));
+    CHECK(x.min(-1).data()[1] == doctest::Approx(x.min(1).data()[1]));
+}
+
+TEST_CASE("min(dim=1) on 3-D tensor reduces middle axis") {
+    const tensor::Tensor<float> x(
+        {2, 3, 2},
+        std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f, 9.f, 10.f, 11.f, 12.f},
+        false);
+    const auto result = x.min(1);
+
+    CHECK(result.shape() == (std::vector<int64_t>{2, 2}));
+    CHECK(result.data()[0] == doctest::Approx(1.f));
+    CHECK(result.data()[1] == doctest::Approx(2.f));
+    CHECK(result.data()[2] == doctest::Approx(7.f));
+    CHECK(result.data()[3] == doctest::Approx(8.f));
+}
+
+TEST_CASE("min(dim) on rank-1 tensor produces scalar shape") {
+    const tensor::Tensor<float> x({4}, std::vector<float>{3.f, 1.f, 4.f, 2.f}, false);
+    const auto result = x.min(0);
+    CHECK(result.shape() == std::vector<int64_t>{});
+    CHECK(result.data()[0] == doctest::Approx(1.f));
+}
+
+TEST_CASE("min(dim) throws on scalar tensor") {
+    const tensor::Tensor<float> x({}, false);
+    CHECK_THROWS_AS(x.min(0), std::invalid_argument);
+}
+
+TEST_CASE("min(dim) throws on out-of-range dimension") {
+    const tensor::Tensor<float> x({2, 3}, false);
+    CHECK_THROWS_AS(x.min(2), std::out_of_range);
+    CHECK_THROWS_AS(x.min(-3), std::out_of_range);
+}
+
+TEST_CASE("min(dim) throws on empty reduced dimension") {
+    const tensor::Tensor<float> x({2, 0}, false);
+    CHECK_THROWS_AS(x.min(1), std::invalid_argument);
+}
+
+TEST_CASE("MinDimBackward scatters grad to the argmin along dim") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, 5.f, 3.f, 4.f, 2.f, 6.f}, true);
+    const auto result = x.min(0);
+    REQUIRE(result.grad_fn().get() != nullptr);
+
+    const tensor::Tensor<float> propagated({3}, std::vector<float>{10.f, 20.f, 30.f}, false);
+    const auto grads = result.grad_fn()->apply(propagated);
+
+    REQUIRE(grads.size() == 1);
+    REQUIRE(grads[0].shape() == (std::vector<int64_t>{2, 3}));
+    CHECK(grads[0].data()[0] == doctest::Approx(10.f));
+    CHECK(grads[0].data()[1] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[2] == doctest::Approx(30.f));
+    CHECK(grads[0].data()[3] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[4] == doctest::Approx(20.f));
+    CHECK(grads[0].data()[5] == doctest::Approx(0.f));
+}
+
+TEST_CASE("MinDimBackward on tie picks first occurrence along dim") {
+    const tensor::Tensor<float> x({2, 3}, std::vector<float>{5.f, 2.f, 3.f, 1.f, 2.f, 3.f}, true);
+    const auto result = x.min(0);
+    const tensor::Tensor<float> propagated({3}, std::vector<float>{1.f, 1.f, 1.f}, false);
+    const auto grads = result.grad_fn()->apply(propagated);
+
+    CHECK(grads[0].data()[0] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[1] == doctest::Approx(1.f));
+    CHECK(grads[0].data()[2] == doctest::Approx(1.f));
+    CHECK(grads[0].data()[3] == doctest::Approx(1.f));
+    CHECK(grads[0].data()[4] == doctest::Approx(0.f));
+    CHECK(grads[0].data()[5] == doctest::Approx(0.f));
+}
+
 // ─── grad node wiring ─────────────────────────────────────────────────────────
 
 TEST_CASE("reduction ops produce no grad_fn when all inputs are no-grad") {
@@ -356,7 +584,9 @@ TEST_CASE("reduction ops produce no grad_fn when all inputs are no-grad") {
     CHECK(x.mean().grad_fn()   .get() == nullptr);
     CHECK(x.mean(0).grad_fn()  .get() == nullptr);
     CHECK(x.max().grad_fn()    .get() == nullptr);
+    CHECK(x.max(0).grad_fn()   .get() == nullptr);
     CHECK(x.min().grad_fn()    .get() == nullptr);
+    CHECK(x.min(0).grad_fn()   .get() == nullptr);
 }
 
 TEST_CASE("softmax along dim=1 normalizes each row") {
@@ -371,6 +601,35 @@ TEST_CASE("softmax along dim=1 normalizes each row") {
     CHECK(s.data()[3] == doctest::Approx(1.f / 3.f));
     CHECK(s.data()[4] == doctest::Approx(1.f / 3.f));
     CHECK(s.data()[5] == doctest::Approx(1.f / 3.f));
+}
+
+TEST_CASE("softmax along a non-last axis normalizes each inner slab") {
+    // shape [2, 3, 2]; dim=1 → two independent 3-vectors per outer, inner=2
+    const tensor::Tensor<float> x(
+        {2, 3, 2},
+        std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f},
+        false);
+    const auto s = x.softmax(1);
+    REQUIRE(s.shape() == (std::vector<int64_t>{2, 3, 2}));
+
+    const float e1 = std::exp(1.f);
+    const float e3 = std::exp(3.f);
+    const float e5 = std::exp(5.f);
+    const float den0 = e1 + e3 + e5;
+    CHECK(s.data()[0] == doctest::Approx(e1 / den0));
+    CHECK(s.data()[2] == doctest::Approx(e3 / den0));
+    CHECK(s.data()[4] == doctest::Approx(e5 / den0));
+
+    const float e2 = std::exp(2.f);
+    const float e4 = std::exp(4.f);
+    const float e6 = std::exp(6.f);
+    const float den1 = e2 + e4 + e6;
+    CHECK(s.data()[1] == doctest::Approx(e2 / den1));
+    CHECK(s.data()[3] == doctest::Approx(e4 / den1));
+    CHECK(s.data()[5] == doctest::Approx(e6 / den1));
+
+    for (size_t i = 6; i < 12; ++i)
+        CHECK(s.data()[i] == doctest::Approx(1.f / 3.f));
 }
 
 TEST_CASE("SoftmaxBackward matches s * (g - sum(g * s))") {
@@ -400,4 +659,19 @@ TEST_CASE("reduction ops wire next_edge to input grad_fn") {
     REQUIRE(result.grad_fn().get() != nullptr);
     REQUIRE(result.grad_fn()->next_edges.size() == 1);
     CHECK(result.grad_fn()->next_edges[0].get() == mid.grad_fn().get());
+}
+
+TEST_CASE("sum of a transpose equals the sum of logical elements") {
+    const tensor::Tensor<float> t({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, false);
+    CHECK(t.transpose().sum().data()[0] == doctest::Approx(21.f));
+}
+
+TEST_CASE("sum of a broadcast counts repeated logical elements") {
+    const tensor::Tensor<float> t({1, 3}, std::vector<float>{1.f, 2.f, 3.f}, false);
+    CHECK(t.broadcast_to({2, 3}).sum().data()[0] == doctest::Approx(12.f));
+}
+
+TEST_CASE("sum of a narrow is only the slice") {
+    const tensor::Tensor<float> t({2, 3}, std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, false);
+    CHECK(t.narrow(1, 1, 2).sum().data()[0] == doctest::Approx(16.f));
 }

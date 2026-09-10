@@ -1,3 +1,15 @@
+/*
+ * SGD: coupled weight decay, skip rules, zero_grad, empty param list.
+ *
+ * - θ ← θ − η(g + λθ) on a scalar
+ * - step with λ=0 on a 2×2
+ * - step with λ>0 on a vector
+ * - skip missing grad; skip frozen (requires_grad=false)
+ * - zero_grad clears .grad()
+ * - empty parameter list throws
+ */
+
+#include <stdexcept>
 #include <vector>
 
 #include "../../doctest/doctest.h"
@@ -74,4 +86,8 @@ TEST_CASE("SGD zero_grad clears accumulated gradients") {
     nn::optim::SGD<float> opt({&x}, 0.1);
     opt.zero_grad();
     CHECK(x.grad() == nullptr);
+}
+
+TEST_CASE("SGD rejects an empty parameter list") {
+    CHECK_THROWS_AS((nn::optim::SGD<float>({}, 0.1)), std::invalid_argument);
 }

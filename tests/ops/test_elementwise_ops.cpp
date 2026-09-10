@@ -1,5 +1,21 @@
+/*
+ * Elementwise ops: arithmetic, activations, and a few Jacobians.
+ *
+ * - add, neg, subtract, multiply, divide, power (float/double/int)
+ * - abs, sqrt; sqrt backward
+ * - exp, log, sin, cos, tan (float/double)
+ * - sinh, cosh, tanh
+ * - sigmoid values and range
+ * - relu zeros negatives; positives unchanged
+ * - silu = x * sigmoid(x); gelu tanh approx
+ * - pack a transpose before the dense loop; relu-after-transpose backward
+ * - divide backward; shape mismatch; divide-by-zero and log of non-positive
+ * - abs/relu at 0; log and sin backward; silu backward
+ */
+
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "../doctest/doctest.h"
@@ -260,4 +276,86 @@ TEST_CASE_TEMPLATE("ops::gelu tanh approximation", T, float, double) {
         * (static_cast<T>(1) + static_cast<T>(std::tanh(k * (x + static_cast<T>(0.044715) * x * x * x))));
     CHECK(result.data()[0] == doctest::Approx(static_cast<T>(0)));
     CHECK(result.data()[1] == doctest::Approx(expected));
+}
+
+TEST_CASE("elementwise ops pack a transpose before the dense loop") {
+    const tensor::Tensor<float> t({2, 3}, std::vector<float>{1.f, -2.f, 3.f, 4.f, -5.f, 6.f}, false);
+    const auto r = t.transpose().relu();
+    CHECK(r.shape() == std::vector<int64_t>{3, 2});
+    CHECK(r.is_contiguous());
+    CHECK(r.data() == std::vector<float>{1.f, 4.f, 0.f, 0.f, 3.f, 6.f});
+}
+
+TEST_CASE("relu after transpose backprops in logical order") {
+    tensor::Tensor<float> x({2, 3}, std::vector<float>{1.f, -2.f, 3.f, 4.f, -5.f, 6.f}, true);
+    x.transpose().relu().sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    const std::vector<float> expected{1.f, 0.f, 1.f, 1.f, 0.f, 1.f};
+    for (size_t i = 0; i < expected.size(); ++i)
+        CHECK(x.grad()->data()[i] == doctest::Approx(expected[i]));
+}
+
+TEST_CASE("divide backward is g/y and -x/y^2 * g") {
+    tensor::Tensor<float> x({2}, std::vector<float>{6.f, 8.f}, true);
+    tensor::Tensor<float> y({2}, std::vector<float>{2.f, 4.f}, true);
+    x.divide(y).sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    REQUIRE(y.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(0.5f));
+    CHECK(x.grad()->data()[1] == doctest::Approx(0.25f));
+    CHECK(y.grad()->data()[0] == doctest::Approx(-1.5f));
+    CHECK(y.grad()->data()[1] == doctest::Approx(-0.5f));
+}
+
+TEST_CASE("elementwise binary ops throw on shape mismatch") {
+    const tensor::Tensor<float> a({2}, std::vector<float>{1.f, 2.f}, false);
+    const tensor::Tensor<float> b({3}, std::vector<float>{1.f, 2.f, 3.f}, false);
+    CHECK_THROWS_AS(ops::add(a, b), std::invalid_argument);
+    CHECK_THROWS_AS(ops::multiply(a, b), std::invalid_argument);
+    CHECK_THROWS_AS(ops::divide(a, b), std::invalid_argument);
+}
+
+TEST_CASE("divide throws on zero and log throws on non-positive") {
+    const tensor::Tensor<float> a({1}, std::vector<float>{1.f}, false);
+    const tensor::Tensor<float> z({1}, std::vector<float>{0.f}, false);
+    CHECK_THROWS_AS(ops::divide(a, z), std::runtime_error);
+    CHECK_THROWS_AS(ops::log(z), std::runtime_error);
+}
+
+TEST_CASE("abs and relu at zero use a zero local gradient") {
+    tensor::Tensor<float> x({3}, std::vector<float>{-1.f, 0.f, 2.f}, true);
+    x.abs().sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(-1.f));
+    CHECK(x.grad()->data()[1] == doctest::Approx(0.f));
+    CHECK(x.grad()->data()[2] == doctest::Approx(1.f));
+
+    tensor::Tensor<float> y({3}, std::vector<float>{-1.f, 0.f, 2.f}, true);
+    y.relu().sum().backward();
+    REQUIRE(y.grad() != nullptr);
+    CHECK(y.grad()->data()[0] == doctest::Approx(0.f));
+    CHECK(y.grad()->data()[1] == doctest::Approx(0.f));
+    CHECK(y.grad()->data()[2] == doctest::Approx(1.f));
+}
+
+TEST_CASE("log and sin backward") {
+    tensor::Tensor<float> x({2}, std::vector<float>{1.f, 2.f}, true);
+    x.log().sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(1.f));
+    CHECK(x.grad()->data()[1] == doctest::Approx(0.5f));
+
+    tensor::Tensor<float> t({2}, std::vector<float>{0.f, 1.f}, true);
+    t.sin().sum().backward();
+    REQUIRE(t.grad() != nullptr);
+    CHECK(t.grad()->data()[0] == doctest::Approx(std::cos(0.f)));
+    CHECK(t.grad()->data()[1] == doctest::Approx(std::cos(1.f)));
+}
+
+TEST_CASE("silu backward is sigmoid(x) * (1 + x * (1 - sigmoid(x)))") {
+    tensor::Tensor<float> x({1}, std::vector<float>{2.f}, true);
+    x.silu().sum().backward();
+    const float s = 1.f / (1.f + std::exp(-2.f));
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(s * (1.f + 2.f * (1.f - s))));
 }

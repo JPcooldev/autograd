@@ -1,3 +1,14 @@
+/*
+ * Adam: coupled weight decay, bias correction, skip missing grad, zero_grad.
+ *
+ * - λ is folded into g before moments
+ * - one step with λ=0; one step with λ>0
+ * - two steps persist moments and apply t=2 bias correction
+ * - two steps with coupled λ
+ * - missing grad does not bump that parameter's t
+ * - zero_grad clears grads without wiping m/v
+ */
+
 #include <vector>
 
 #include "../../doctest/doctest.h"

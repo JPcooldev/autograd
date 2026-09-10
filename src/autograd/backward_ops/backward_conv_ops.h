@@ -20,7 +20,21 @@ class ConvBackward : public Node<T> {
     std::vector<int64_t> in_shape_;
     std::vector<int64_t> w_shape_;
     std::vector<int64_t> out_shape_;
+
 public:
+    /**
+     * Construct the backward node for convolution.
+     * Aliases `input` and `weight` (and `bias` when non-null) and stores
+     * convolution hyperparameters plus input/weight/output shapes.
+     *
+     * @param input Forward input (N, Cin, *spatial).
+     * @param weight Forward weight (Cout, Cin, *K).
+     * @param bias Optional bias (Cout), or nullptr.
+     * @param stride Convolution stride.
+     * @param padding Spatial padding.
+     * @param dilation Kernel dilation.
+     * @param out_shape Forward output shape.
+     */
     ConvBackward(
         const Tensor<T>& input,
         const Tensor<T>& weight,
@@ -33,8 +47,7 @@ public:
         : stride_(stride), padding_(padding), dilation_(dilation),
           has_bias_(bias != nullptr),
           in_shape_(input.shape()), w_shape_(weight.shape()),
-          out_shape_(std::move(out_shape))
-    {
+          out_shape_(std::move(out_shape)) {
         const size_t n = has_bias_ ? 3 : 2;
         this->saved_tensors.reserve(n);
         this->next_edges.reserve(n);
@@ -48,8 +61,17 @@ public:
         }
     }
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
+    /**
+     * Compute convolution input, weight, and optional bias gradients.
+     * Uses saved input and weight (contiguous copies) plus stored shapes and
+     * `stride_` / `padding_` / `dilation_`; bias grad sums `propagated_grad`
+     * over batch and spatial dims.
+     *
+     * @param propagated_grad Upstream gradient dL/d(output).
+     * @return `{dL/d(input), dL/d(weight)}`, plus `dL/d(bias)` when a bias
+     *         was saved.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         using namespace ops::conv_detail;
         const Tensor<T>& input = this->saved_tensors[0];
         const Tensor<T>& weight = this->saved_tensors[1];
@@ -90,7 +112,21 @@ class ConvTransposeBackward : public Node<T> {
     std::vector<int64_t> in_shape_;
     std::vector<int64_t> w_shape_;
     std::vector<int64_t> out_shape_;
+
 public:
+    /**
+     * Construct the backward node for transposed convolution.
+     * Aliases `input` and `weight` (and `bias` when non-null) and stores
+     * hyperparameters plus input/weight/output shapes.
+     *
+     * @param input Forward input (N, Cin, *spatial).
+     * @param weight Forward weight (Cin, Cout, *K).
+     * @param bias Optional bias (Cout), or nullptr.
+     * @param stride Transposed-convolution stride.
+     * @param padding Spatial padding.
+     * @param dilation Kernel dilation.
+     * @param out_shape Forward output shape.
+     */
     ConvTransposeBackward(
         const Tensor<T>& input,
         const Tensor<T>& weight,
@@ -103,8 +139,7 @@ public:
         : stride_(stride), padding_(padding), dilation_(dilation),
           has_bias_(bias != nullptr),
           in_shape_(input.shape()), w_shape_(weight.shape()),
-          out_shape_(std::move(out_shape))
-    {
+          out_shape_(std::move(out_shape)) {
         const size_t n = has_bias_ ? 3 : 2;
         this->saved_tensors.reserve(n);
         this->next_edges.reserve(n);
@@ -118,8 +153,16 @@ public:
         }
     }
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
+    /**
+     * Compute transposed-convolution input, weight, and optional bias gradients.
+     * Uses saved input and weight plus stored shapes and hyperparameters;
+     * bias length is `w_shape_[1]` (Cout).
+     *
+     * @param propagated_grad Upstream gradient dL/d(output).
+     * @return `{dL/d(input), dL/d(weight)}`, plus `dL/d(bias)` when a bias
+     *         was saved.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         using namespace ops::conv_detail;
         const Tensor<T>& input = this->saved_tensors[0];
         const Tensor<T>& weight = this->saved_tensors[1];

@@ -11,22 +11,37 @@ namespace autograd {
 
 using tensor::Tensor;
 
-// ----- L1LossBackward -----
-// Forward:  L = mean(|input - target|)
-// Backward: dL/d(input)  =  sign(input - target) / N * g
-//           dL/d(target) = -sign(input - target) / N * g
 template <typename T>
 class L1LossBackward : public Node<T> {
     std::vector<int64_t> shape_;
     int64_t numel_;
-public:
-    L1LossBackward(const Tensor<T>& input, const Tensor<T>& target)
-        : Node<T>(input, target), shape_(input.shape()), numel_(input.numel()) {}
+    bool reduction_;
 
+public:
+    /**
+     * Construct the backward node for L1 loss.
+     * Aliases `input` and `target` and stores shape, numel, and reduction.
+     *
+     * @param input Forward predictions.
+     * @param target Forward targets.
+     * @param reduction True if the forward loss was a mean, false if a sum.
+     */
+    L1LossBackward(const Tensor<T>& input, const Tensor<T>& target, bool reduction)
+        : Node<T>(input, target), shape_(input.shape()), numel_(input.numel()), reduction_(reduction) {}
+
+    /**
+     * Compute L1 loss gradients.
+     * Uses saved input and target: dL/d(input) = sign(input - target) / denom * g
+     * and dL/d(target) = -that, with denom = N if `reduction_` else 1.
+     *
+     * @param propagated_grad Scalar upstream gradient dL/dL_loss.
+     * @return `{dL/d(input), dL/d(target)}`.
+     */
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         const Tensor<T>& inp = this->saved_tensors[0];
         const Tensor<T>& tgt = this->saved_tensors[1];
-        const T scale = propagated_grad.data()[0] / static_cast<T>(numel_);
+        const T denom = reduction_ ? static_cast<T>(numel_) : T{1};
+        const T scale = propagated_grad.data()[0] / denom;
 
         const size_t n = static_cast<size_t>(numel_);
         std::vector<T> gi(n), gt(n);
@@ -43,22 +58,37 @@ public:
     }
 };
 
-// ----- L2LossBackward -----
-// Forward:  L = sum((input - target)^2)   [un-normalised squared L2 error]
-// Backward: dL/d(input)  =  2 * (input - target) * g
-//           dL/d(target) = -2 * (input - target) * g
 template <typename T>
 class L2LossBackward : public Node<T> {
     std::vector<int64_t> shape_;
     int64_t numel_;
-public:
-    L2LossBackward(const Tensor<T>& input, const Tensor<T>& target)
-        : Node<T>(input, target), shape_(input.shape()), numel_(input.numel()) {}
+    bool reduction_;
 
+public:
+    /**
+     * Construct the backward node for L2 (squared-error) loss.
+     * Aliases `input` and `target` and stores shape, numel, and reduction.
+     *
+     * @param input Forward predictions.
+     * @param target Forward targets.
+     * @param reduction True if the forward loss was a mean, false if a sum.
+     */
+    L2LossBackward(const Tensor<T>& input, const Tensor<T>& target, bool reduction)
+        : Node<T>(input, target), shape_(input.shape()), numel_(input.numel()), reduction_(reduction) {}
+
+    /**
+     * Compute L2 loss gradients.
+     * Uses saved input and target: dL/d(input) = 2 * (input - target) / denom * g
+     * and dL/d(target) = -that, with denom = N if `reduction_` else 1.
+     *
+     * @param propagated_grad Scalar upstream gradient dL/dL_loss.
+     * @return `{dL/d(input), dL/d(target)}`.
+     */
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         const Tensor<T>& inp = this->saved_tensors[0];
         const Tensor<T>& tgt = this->saved_tensors[1];
-        const T g = static_cast<T>(2) * propagated_grad.data()[0];
+        const T denom = reduction_ ? static_cast<T>(numel_) : T{1};
+        const T g = static_cast<T>(2) * propagated_grad.data()[0] / denom;
 
         const size_t n = static_cast<size_t>(numel_);
         std::vector<T> gi(n), gt(n);
@@ -74,51 +104,32 @@ public:
     }
 };
 
-// ----- MSELossBackward -----
-// Forward:  L = mean((input - target)^2)
-// Backward: dL/d(input)  =  2 * (input - target) / N * g
-//           dL/d(target) = -2 * (input - target) / N * g
-template <typename T>
-class MSELossBackward : public Node<T> {
-    std::vector<int64_t> shape_;
-    int64_t numel_;
-public:
-    MSELossBackward(const Tensor<T>& input, const Tensor<T>& target)
-        : Node<T>(input, target), shape_(input.shape()), numel_(input.numel()) {}
-
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
-        const Tensor<T>& inp = this->saved_tensors[0];
-        const Tensor<T>& tgt = this->saved_tensors[1];
-        const T scale = static_cast<T>(2) * propagated_grad.data()[0] / static_cast<T>(numel_);
-
-        const size_t n = static_cast<size_t>(numel_);
-        std::vector<T> gi(n), gt(n);
-        for (size_t i = 0; i < n; ++i) {
-            const T diff = inp.data()[i] - tgt.data()[i];
-            gi[i] =  scale * diff;
-            gt[i] = -scale * diff;
-        }
-        return {
-            Tensor<T>::from_operation_result(shape_, std::move(gi), false, nullptr),
-            Tensor<T>::from_operation_result(shape_, std::move(gt), false, nullptr)
-        };
-    }
-};
-
-// ----- NLLLossBackward -----
-// Forward:  L = -(1/N_batch) * sum_{n,c} target_{n,c} * input_{n,c}
-//           where input = log-probabilities, N_batch = numel / shape[dim]
-// Backward: dL/d(input_{n,c})  = -target_{n,c} / N_batch * g
-//           dL/d(target_{n,c}) = -input_{n,c}  / N_batch * g
 template <typename T>
 class NLLLossBackward : public Node<T> {
     std::vector<int64_t> shape_;
     int64_t numel_;
     int64_t n_batch_;
+
 public:
+    /**
+     * Construct the backward node for negative log-likelihood loss.
+     * Aliases `input` (log-probs) and `target` and stores shape, numel, and batch size.
+     *
+     * @param input Forward log-probabilities.
+     * @param target Forward class weights / one-hot targets.
+     * @param n_batch Batch size used as the forward mean denominator.
+     */
     NLLLossBackward(const Tensor<T>& input, const Tensor<T>& target, int64_t n_batch)
         : Node<T>(input, target), shape_(input.shape()), numel_(input.numel()), n_batch_(n_batch) {}
 
+    /**
+     * Compute NLL gradients: dL/d(input) = -target / n_batch * g,
+     * dL/d(target) = -input / n_batch * g.
+     * Uses saved input and target.
+     *
+     * @param propagated_grad Scalar upstream gradient dL/dL_loss.
+     * @return `{dL/d(input), dL/d(target)}`.
+     */
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         const Tensor<T>& inp = this->saved_tensors[0];
         const Tensor<T>& tgt = this->saved_tensors[1];
@@ -137,25 +148,45 @@ public:
     }
 };
 
-// ----- CrossEntropyLossBackward -----
-// Forward:  L = -(1/N_batch) * sum_{n,c} target_{n,c} * log_softmax(input)_{n,c}
-//           (fused log-softmax + NLL for numerical stability)
-// Backward: dL/d(input_{n,c})  = (softmax_{n,c} - target_{n,c}) / N_batch * g
-//           dL/d(target_{n,c}) = -log_softmax(input)_{n,c} / N_batch * g
-//           log_softmax is recovered as log(softmax_out) from the saved output.
 template <typename T>
 class CrossEntropyLossBackward : public Node<T> {
     Tensor<T> softmax_out_;  // saved no-grad softmax(input, dim)
     std::vector<int64_t> shape_;
     int64_t numel_;
     int64_t n_batch_;
+
 public:
-    CrossEntropyLossBackward(const Tensor<T>& input, const Tensor<T>& target,
-                              const Tensor<T>& softmax_out, int64_t n_batch)
+    /**
+     * Construct the backward node for fused softmax + NLL (cross entropy).
+     * Aliases `input` and `target`, aliases `softmax_out` into `softmax_out_`,
+     * and stores shape, numel, and batch size.
+     *
+     * @param input Forward logits (saved for the graph edge; unused in apply).
+     * @param target Forward targets.
+     * @param softmax_out Detached softmax(input) from the forward pass.
+     * @param n_batch Batch size used as the forward mean denominator.
+     */
+    CrossEntropyLossBackward(
+        const Tensor<T>& input,
+        const Tensor<T>& target,
+        const Tensor<T>& softmax_out,
+        int64_t n_batch
+    )
         : Node<T>(input, target),
           softmax_out_(Tensor<T>::alias(softmax_out)),
-          shape_(input.shape()), numel_(input.numel()), n_batch_(n_batch) {}
+          shape_(input.shape()),
+          numel_(input.numel()),
+          n_batch_(n_batch) {}
 
+    /**
+     * Compute cross-entropy gradients from saved softmax and target.
+     * dL/d(input) = (softmax - target) / n_batch * g;
+     * dL/d(target) = -log(softmax) / n_batch * g with softmax clamped by epsilon.
+     * Saved input is unused.
+     *
+     * @param propagated_grad Scalar upstream gradient dL/dL_loss.
+     * @return `{dL/d(input), dL/d(target)}`.
+     */
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         const Tensor<T>& tgt = this->saved_tensors[1];
         const T scale = propagated_grad.data()[0] / static_cast<T>(n_batch_);
@@ -175,19 +206,30 @@ public:
     }
 };
 
-// ----- BCELossBackward -----
-// Forward:  L = -mean(target * log(input) + (1 - target) * log(1 - input))
-//           input must lie in (0, 1); clamped to [eps, 1-eps] for numerical safety.
-// Backward: dL/d(input)  = (input - target) / (input * (1 - input)) / N * g
-//           dL/d(target) = -(log(input) - log(1 - input)) / N * g
 template <typename T>
 class BCELossBackward : public Node<T> {
     std::vector<int64_t> shape_;
     int64_t numel_;
+
 public:
+    /**
+     * Construct the backward node for binary cross-entropy.
+     * Aliases `input` and `target` and stores shape and numel.
+     *
+     * @param input Forward probabilities in (0, 1).
+     * @param target Forward binary targets.
+     */
     BCELossBackward(const Tensor<T>& input, const Tensor<T>& target)
         : Node<T>(input, target), shape_(input.shape()), numel_(input.numel()) {}
 
+    /**
+     * Compute BCE gradients from saved input and target.
+     * Input is clamped to [eps, 1-eps]; dL/d(input) = (p - t) / (p*(1-p)) / N * g
+     * and dL/d(target) = -(log(p) - log(1-p)) / N * g.
+     *
+     * @param propagated_grad Scalar upstream gradient dL/dL_loss.
+     * @return `{dL/d(input), dL/d(target)}`.
+     */
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         const Tensor<T>& inp = this->saved_tensors[0];
         const Tensor<T>& tgt = this->saved_tensors[1];
@@ -210,18 +252,30 @@ public:
     }
 };
 
-// ----- BCEWithLogitsLossBackward -----
-// Forward:  L = mean(log(1 + exp(input)) - input * target)  [numerically stable]
-// Backward: dL/d(input)  = (sigmoid(input) - target) / N * g
-//           dL/d(target) = -input / N * g
 template <typename T>
 class BCEWithLogitsLossBackward : public Node<T> {
     std::vector<int64_t> shape_;
     int64_t numel_;
+
 public:
+    /**
+     * Construct the backward node for BCE-with-logits.
+     * Aliases `input` and `target` and stores shape and numel.
+     *
+     * @param input Forward logits.
+     * @param target Forward binary targets.
+     */
     BCEWithLogitsLossBackward(const Tensor<T>& input, const Tensor<T>& target)
         : Node<T>(input, target), shape_(input.shape()), numel_(input.numel()) {}
 
+    /**
+     * Compute BCE-with-logits gradients from saved input and target.
+     * dL/d(input) = (sigmoid(input) - target) / N * g,
+     * dL/d(target) = -input / N * g.
+     *
+     * @param propagated_grad Scalar upstream gradient dL/dL_loss.
+     * @return `{dL/d(input), dL/d(target)}`.
+     */
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         const Tensor<T>& inp = this->saved_tensors[0];
         const Tensor<T>& tgt = this->saved_tensors[1];
@@ -242,19 +296,30 @@ public:
     }
 };
 
-// ----- KLDivLossBackward -----
-// Forward:  L = mean(target * (log(target) - input))   [input = log-probabilities]
-// Backward: dL/d(input)  = -target / N * g
-//           dL/d(target) = (log(target) - input + 1) / N * g
-//           (d/dt [t*log(t)] = log(t) + 1; target clamped to avoid log(0))
 template <typename T>
 class KLDivLossBackward : public Node<T> {
     std::vector<int64_t> shape_;
     int64_t numel_;
+
 public:
+    /**
+     * Construct the backward node for KL divergence (mean reduction).
+     * Aliases `input` (log-probs) and `target` and stores shape and numel.
+     *
+     * @param input Forward log-probabilities.
+     * @param target Forward probabilities.
+     */
     KLDivLossBackward(const Tensor<T>& input, const Tensor<T>& target)
         : Node<T>(input, target), shape_(input.shape()), numel_(input.numel()) {}
 
+    /**
+     * Compute KL-div gradients from saved input and target.
+     * dL/d(input) = -target / N * g;
+     * dL/d(target) = (log(target) - input + 1) / N * g with target clamped for log.
+     *
+     * @param propagated_grad Scalar upstream gradient dL/dL_loss.
+     * @return `{dL/d(input), dL/d(target)}`.
+     */
     std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         const Tensor<T>& inp = this->saved_tensors[0];
         const Tensor<T>& tgt = this->saved_tensors[1];

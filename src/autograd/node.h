@@ -9,40 +9,65 @@ namespace autograd {
 
 using tensor::Tensor;
 
-template<typename T>
+template <typename T>
 class Node {
 public:
-    // can operation return multiple outputs that are needed for backpropagation of gradients?
-    // virtual std::vector<Tensor<T>> apply(const std::vector<Tensor<T>>& grad_outputs) = 0;
-    virtual std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) = 0;
-
     std::vector<std::shared_ptr<Node<T>>> next_edges;   // "children" = input tensors' grad_fn
     std::vector<Tensor<T>> saved_tensors;               // values needed for backward
 
+    /**
+     * Default-construct an empty node with no saved tensors or edges.
+     */
     Node() = default;
 
+    /**
+     * Destroy the node.
+     */
     virtual ~Node() = default;
 
-    // Returns the correct backward edge for tensor x:
-    //   - intermediate tensor (has grad_fn)  → its grad_fn
-    //   - leaf tensor that requires_grad      → nullptr  (engine accumulates via
-    //                                           saved_tensors, no AccumulateGrad node)
-    //   - no-grad tensor                      → nullptr (gradient not needed)
+    /**
+     * Compute input gradients from the upstream output gradient.
+     * Each subclass implements the local Jacobian of its forward op.
+     *
+     * @param propagated_grad Upstream gradient with respect to this node's output.
+     * @return Per-input gradients, aligned with `next_edges` / `saved_tensors`.
+     */
+    virtual std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) = 0;
+
+    /**
+     * Return the backward edge to attach for tensor `x`.
+     * Intermediate tensors yield their `grad_fn`; leaves and no-grad tensors
+     * yield nullptr so the engine can accumulate via `saved_tensors` or skip.
+     *
+     * @param x Tensor whose producer edge is requested.
+     * @return `x.grad_fn()` if present, otherwise nullptr.
+     */
     static std::shared_ptr<Node<T>> get_next_edge(const Tensor<T>& x) {
-        if (x.grad_fn()) return x.grad_fn();
+        if (x.grad_fn())
+            return x.grad_fn();
         return nullptr;
     }
 
+    /**
+     * Construct a unary node. Aliases `x` into `saved_tensors` and records its
+     * next edge, reserving capacity so those pushes cannot reallocate.
+     *
+     * @param x Forward input to save.
+     */
     explicit Node(const Tensor<T>& x) {
-        // Pre-allocate exact capacity so pushes below cannot trigger reallocation.
         saved_tensors.reserve(1);
         next_edges.reserve(1);
         saved_tensors.emplace_back(Tensor<T>::alias(x));
         next_edges.emplace_back(get_next_edge(x));
     }
 
+    /**
+     * Construct a binary node. Aliases `x` then `y` and records both next edges.
+     *
+     * @param x First forward input to save.
+     * @param y Second forward input to save.
+     */
     Node(const Tensor<T>& x, const Tensor<T>& y) {
-        // Pre-allocate exact capacity so pushes below cannot trigger reallocation.
         saved_tensors.reserve(2);
         next_edges.reserve(2);
         saved_tensors.emplace_back(Tensor<T>::alias(x));
@@ -51,6 +76,14 @@ public:
         next_edges.emplace_back(get_next_edge(y));
     }
 
+    /**
+     * Construct a ternary node. Aliases `x`, `y`, then `z` and records all
+     * next edges.
+     *
+     * @param x First forward input to save.
+     * @param y Second forward input to save.
+     * @param z Third forward input to save.
+     */
     Node(const Tensor<T>& x, const Tensor<T>& y, const Tensor<T>& z) {
         saved_tensors.reserve(3);
         next_edges.reserve(3);
@@ -61,6 +94,6 @@ public:
         next_edges.emplace_back(get_next_edge(y));
         next_edges.emplace_back(get_next_edge(z));
     }
-};  
+};
 
 } // namespace autograd

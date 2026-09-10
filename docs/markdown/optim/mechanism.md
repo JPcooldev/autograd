@@ -1,6 +1,6 @@
 # Optimizer internals
 
-How gradients get from a backward pass into a parameter update in this library. The math of each optimizer is in [theory.md](theory.md).
+How gradients get from a backward pass into a parameter update in this library. Constructors: [reference.md](reference.md). The math of each optimizer is in [theory.md](theory.md).
 
 ## Training step
 

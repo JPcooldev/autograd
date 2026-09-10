@@ -1,3 +1,20 @@
+/*
+ * Autograd engine: leaf vs non-leaf, backward, accumulation, casts, grad mode.
+ *
+ * - is_leaf on a user tensor vs an op output
+ * - .grad() is null before backward, on a no-grad leaf, and on a non-leaf
+ * - backward() rejects a non-scalar output and a leaf
+ * - sum / mean / add / subtract / multiply / power / exp / sigmoid grads
+ * - no-grad operand is skipped; the other leaf still gets the product rule
+ * - zero_grad, accumulation across two passes, then a fresh pass
+ * - dot and 2-D matmul grads
+ * - float/double casts, sandwich casts, mixed-dtype add
+ * - NoGradContext: no grad_fn, restore on exit, nested guards, AutoGradContext
+ * - diamond (h+h) accumulation, reusing one graph, non-1 upstream scale
+ * - 0-dim backward, disconnected leaf stays without a grad
+ */
+
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
@@ -106,6 +123,9 @@ TEST_CASE("backward: no-grad leaf receives no gradient") {
 
     REQUIRE(x.grad() != nullptr);
     CHECK(c.grad() == nullptr);  // requires_grad=false leaf never gets a gradient
+    CHECK(x.grad()->data()[0] == doctest::Approx(2.f));
+    CHECK(x.grad()->data()[1] == doctest::Approx(2.f));
+    CHECK(x.grad()->data()[2] == doctest::Approx(2.f));
 }
 
 // ─── backward: quadratic (shared leaf x used twice) ──────────────────────────
@@ -292,8 +312,80 @@ TEST_CASE("backward: mixed-dtype add float + double") {
 
 TEST_CASE("to() under NoGradContext does not attach grad_fn") {
     tensor::Tensor<float> x({2}, std::vector<float>{1.f, 2.f}, true);
-    autograd::NoGradContext guard;
-    const auto y = x.to<double>();
-    CHECK_FALSE(y.requires_grad());
-    CHECK(y.grad_fn().get() == nullptr);
+    CHECK(autograd::is_grad_enabled());
+    {
+        autograd::NoGradContext guard;
+        CHECK_FALSE(autograd::is_grad_enabled());
+        const auto y = x.to<double>();
+        CHECK_FALSE(y.requires_grad());
+        CHECK(y.grad_fn().get() == nullptr);
+        const auto z = x.add(x);
+        CHECK_FALSE(z.requires_grad());
+        CHECK(z.grad_fn().get() == nullptr);
+    }
+    CHECK(autograd::is_grad_enabled());
+    const auto w = x.add(x);
+    CHECK(w.requires_grad());
+    CHECK(w.grad_fn().get() != nullptr);
+}
+
+TEST_CASE("nested NoGradContext restores the inner disabled mode") {
+    CHECK(autograd::is_grad_enabled());
+    {
+        autograd::NoGradContext outer;
+        CHECK_FALSE(autograd::is_grad_enabled());
+        {
+            autograd::NoGradContext inner;
+            CHECK_FALSE(autograd::is_grad_enabled());
+        }
+        CHECK_FALSE(autograd::is_grad_enabled());
+        autograd::AutoGradContext enable(true);
+        CHECK(autograd::is_grad_enabled());
+    }
+    CHECK(autograd::is_grad_enabled());
+}
+
+TEST_CASE("diamond graph accumulates into a non-leaf intermediate") {
+    tensor::Tensor<float> x({3}, std::vector<float>{-1.f, 0.f, 2.f}, true);
+    auto h = x.relu();
+    h.add(h).sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(0.f));
+    CHECK(x.grad()->data()[1] == doctest::Approx(0.f));
+    CHECK(x.grad()->data()[2] == doctest::Approx(2.f));
+}
+
+TEST_CASE("reusing one graph accumulates leaf grads") {
+    tensor::Tensor<float> x({3}, std::vector<float>{1.f, 2.f, 3.f}, true);
+    auto y = x.sum();
+    y.backward();
+    y.backward();
+    REQUIRE(x.grad() != nullptr);
+    for (size_t i = 0; i < 3; ++i)
+        CHECK(x.grad()->data()[i] == doctest::Approx(2.f));
+}
+
+TEST_CASE("non-unit upstream scalar scales the leaf gradient") {
+    tensor::Tensor<float> x({2}, std::vector<float>{1.f, 2.f}, true);
+    x.sum().exp().backward();
+    const float scale = std::exp(3.f);
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->data()[0] == doctest::Approx(scale));
+    CHECK(x.grad()->data()[1] == doctest::Approx(scale));
+}
+
+TEST_CASE("0-dim tensor backward seeds a matching scalar") {
+    tensor::Tensor<float> x({}, std::vector<float>{2.f}, true);
+    x.exp().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(x.grad()->shape() == std::vector<int64_t>{});
+    CHECK(x.grad()->data()[0] == doctest::Approx(std::exp(2.f)));
+}
+
+TEST_CASE("disconnected leaf is left without a gradient") {
+    tensor::Tensor<float> x({2}, std::vector<float>{1.f, 2.f}, true);
+    tensor::Tensor<float> y({2}, std::vector<float>{3.f, 4.f}, true);
+    x.sum().backward();
+    REQUIRE(x.grad() != nullptr);
+    CHECK(y.grad() == nullptr);
 }

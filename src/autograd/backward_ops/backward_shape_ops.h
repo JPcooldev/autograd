@@ -12,21 +12,45 @@ using tensor::Tensor;
 
 template <typename T>
 class TransposeBackward : public Node<T> {
-    private: // for inverse transpose
     int64_t dim0_;
     int64_t dim1_;
-public:
-    TransposeBackward(const Tensor<T>& x, const int64_t dim0, const int64_t dim1)
-        : Node<T>(x), dim0_(dim0), dim1_(dim1)
-    {}
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override 
-    {
-        // Inverse of a transpose is the same transpose over the same dimensions.
+public:
+    /**
+     * Construct the backward node for transpose.
+     * Aliases `x` for the graph edge and stores the swapped dimension pair.
+     *
+     * @param x Forward input (edge only; unused in apply).
+     * @param dim0 First transposed axis (already normalized).
+     * @param dim1 Second transposed axis (already normalized).
+     */
+    TransposeBackward(const Tensor<T>& x, const int64_t dim0, const int64_t dim1)
+        : Node<T>(x), dim0_(dim0), dim1_(dim1) {}
+
+    /**
+     * Invert a transpose by transposing `propagated_grad` on the same axes.
+     * Uses stored `dim0_` and `dim1_`.
+     *
+     * @param propagated_grad Upstream gradient dL/d(transposed output).
+     * @return `{dL/dx}`.
+     *
+     * @throws std::invalid_argument if `propagated_grad` is a scalar.
+     * @throws std::out_of_range if `dim0_` or `dim1_` is out of range for
+     *         `propagated_grad`.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         return {propagated_grad.transpose(dim0_, dim1_)};
     }
 };
 
+/**
+ * Allocate a `TransposeBackward` node for `input`.
+ *
+ * @param input Forward tensor that was transposed.
+ * @param dim0 First transposed axis.
+ * @param dim1 Second transposed axis.
+ * @return Shared pointer to the new node.
+ */
 template <typename T>
 std::shared_ptr<Node<T>> make_transpose_backward_node(const Tensor<T>& input,
                                                       const int64_t dim0,
@@ -37,48 +61,58 @@ std::shared_ptr<Node<T>> make_transpose_backward_node(const Tensor<T>& input,
 template <typename T>
 class ReshapeBackward : public Node<T> {
     std::vector<int64_t> original_shape_;
-public:
-    ReshapeBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
-        : Node<T>(x), original_shape_(std::move(original_shape))
-    {}
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
+public:
+    /**
+     * Construct the backward node for reshape.
+     * Aliases `x` for the graph edge and stores the pre-reshape shape.
+     *
+     * @param x Forward input (edge only; unused in apply).
+     * @param original_shape Shape of `x` before reshape.
+     */
+    ReshapeBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
+        : Node<T>(x), original_shape_(std::move(original_shape)) {}
+
+    /**
+     * Reshape `propagated_grad` back to `original_shape_`.
+     *
+     * @param propagated_grad Upstream gradient dL/d(reshaped output).
+     * @return `{dL/dx}`.
+     *
+     * @throws std::invalid_argument if `propagated_grad` is a scalar.
+     * @throws std::invalid_argument if numel would change.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         return {propagated_grad.reshape(original_shape_)};
     }
 };
 
-// Reduce `grad` (shape: out_shape) back to `target_shape` by summing over all
-// axes that were introduced by broadcasting:
-//   - prepended axes (rank_diff leading dims not present in the original tensor)
-//   - axes where target_shape[i] == 1 but out_shape[i] > 1
-//
-// This is the mathematical inverse of broadcast_to: broadcasting repeats an
-// element N times along an axis, so the gradient contribution from all N
-// positions must be summed back into the single original element.
-//
-// Assumption: `grad` is contiguous (flat data index == logical index).
-// This holds because all backward-pass outputs are freshly allocated tensors.
+/**
+ * Sum `grad` back to `target_shape` over broadcast axes.
+ * Sums prepended leading dims and axes where `target_shape[i] == 1` but
+ * `grad` is larger. Assumes `grad` is contiguous (flat index = logical index).
+ *
+ * @param grad Gradient in the broadcast (output) shape.
+ * @param target_shape Shape of the tensor before `broadcast_to`.
+ * @return Gradient with `target_shape`.
+ *
+ * @throws std::invalid_argument if `target_shape` has a negative dimension.
+ * @throws std::overflow_error if a numel product overflows.
+ */
 template <typename T>
 Tensor<T> sum_to(const Tensor<T>& grad, const std::vector<int64_t>& target_shape) {
-    // Fast path: no reduction required.
-    if (grad.shape() == target_shape) {
+    if (grad.shape() == target_shape)
         return Tensor<T>::from_operation_result(
             target_shape,
             std::vector<T>(grad.data().begin(), grad.data().end()),
             false, nullptr
         );
-    }
 
     const int64_t grad_rank   = grad.rank();
     const int64_t target_rank = static_cast<int64_t>(target_shape.size());
-    // broadcast_to always keeps or increases rank, so grad_rank >= target_rank.
     const int64_t rank_diff   = grad_rank - target_rank;
 
-    // Contiguous strides for grad: used to decompose a flat index into a
-    // per-axis multi-index without needing a separate modulo-only loop.
     const auto grad_cont_strides = Tensor<T>::compute_contiguous_strides(grad.shape());
-    // Contiguous strides for the output: used to re-compose the reduced multi-index.
     const auto out_cont_strides  = Tensor<T>::compute_contiguous_strides(target_shape);
 
     const int64_t out_numel = Tensor<T>::compute_numel(target_shape);
@@ -89,16 +123,11 @@ Tensor<T> sum_to(const Tensor<T>& grad, const std::vector<int64_t>& target_shape
         int64_t remaining = flat;
 
         for (int64_t d = 0; d < grad_rank; ++d) {
-            // Decompose remaining flat offset into the index along dim d.
             const int64_t idx = remaining / grad_cont_strides[static_cast<size_t>(d)];
             remaining        %= grad_cont_strides[static_cast<size_t>(d)];
 
-            // The corresponding dimension in the target (negative → prepended dim).
             const int64_t td = d - rank_diff;
 
-            // Prepended dims and size-1 target dims are broadcast axes.
-            // Their index does not contribute to the output position —
-            // all positions along a broadcast axis map to the same output element.
             const bool is_broadcast_dim =
                 (td < 0) || (target_shape[static_cast<size_t>(td)] == 1);
 
@@ -117,78 +146,145 @@ Tensor<T> sum_to(const Tensor<T>& grad, const std::vector<int64_t>& target_shape
 template <typename T>
 class FlattenBackward : public Node<T> {
     std::vector<int64_t> original_shape_;
-public:
-    FlattenBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
-        : Node<T>(x), original_shape_(std::move(original_shape))
-    {}
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
+public:
+    /**
+     * Construct the backward node for flatten.
+     * Aliases `x` and stores the pre-flatten shape.
+     *
+     * @param x Forward input (edge only; unused in apply).
+     * @param original_shape Shape of `x` before flatten.
+     */
+    FlattenBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
+        : Node<T>(x), original_shape_(std::move(original_shape)) {}
+
+    /**
+     * Reshape `propagated_grad` back to `original_shape_`.
+     *
+     * @param propagated_grad Upstream gradient dL/d(flattened output).
+     * @return `{dL/dx}`.
+     *
+     * @throws std::invalid_argument if `propagated_grad` is a scalar.
+     * @throws std::invalid_argument if numel would change.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         return {propagated_grad.reshape(original_shape_)};
     }
 };
 
-// Backward for squeeze (both the no-arg and dim variant): reshapes grad back
-// to the pre-squeeze shape, which is the exact inverse of squeeze.
 template <typename T>
 class SqueezeBackward : public Node<T> {
     std::vector<int64_t> original_shape_;
-public:
-    SqueezeBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
-        : Node<T>(x), original_shape_(std::move(original_shape))
-    {}
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
+public:
+    /**
+     * Construct the backward node for squeeze (all axes or a single dim).
+     * Aliases `x` and stores the pre-squeeze shape.
+     *
+     * @param x Forward input (edge only; unused in apply).
+     * @param original_shape Shape of `x` before squeeze.
+     */
+    SqueezeBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
+        : Node<T>(x), original_shape_(std::move(original_shape)) {}
+
+    /**
+     * Reshape `propagated_grad` back to `original_shape_`.
+     *
+     * @param propagated_grad Upstream gradient dL/d(squeezed output).
+     * @return `{dL/dx}`.
+     *
+     * @throws std::invalid_argument if `propagated_grad` is a scalar.
+     * @throws std::invalid_argument if numel would change.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
+        // squeeze of an all-ones shape yields a rank-0 scalar; reshape rejects
+        // rank-0 inputs, so rebuild the original layout from the scalar value.
+        if (propagated_grad.rank() == 0) {
+            const int64_t n = Tensor<T>::compute_numel(original_shape_);
+            std::vector<T> storage(static_cast<size_t>(n), propagated_grad.data()[0]);
+            return {Tensor<T>::from_operation_result(
+                original_shape_, std::move(storage), false, nullptr)};
+        }
         return {propagated_grad.reshape(original_shape_)};
     }
 };
 
-// Backward for unsqueeze: reshapes grad back to the pre-unsqueeze shape,
-// which is the exact inverse of unsqueeze.
 template <typename T>
 class UnsqueezeBackward : public Node<T> {
     std::vector<int64_t> original_shape_;
-public:
-    UnsqueezeBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
-        : Node<T>(x), original_shape_(std::move(original_shape))
-    {}
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
+public:
+    /**
+     * Construct the backward node for unsqueeze.
+     * Aliases `x` and stores the pre-unsqueeze shape.
+     *
+     * @param x Forward input (edge only; unused in apply).
+     * @param original_shape Shape of `x` before unsqueeze.
+     */
+    UnsqueezeBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
+        : Node<T>(x), original_shape_(std::move(original_shape)) {}
+
+    /**
+     * Reshape `propagated_grad` back to `original_shape_`.
+     *
+     * @param propagated_grad Upstream gradient dL/d(unsqueezed output).
+     * @return `{dL/dx}`.
+     *
+     * @throws std::invalid_argument if `propagated_grad` is a scalar.
+     * @throws std::invalid_argument if numel would change.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         return {propagated_grad.reshape(original_shape_)};
     }
 };
 
-// Layout-only op: values and logical shape are unchanged. The incoming
-// gradient is already in logical (row-major) order, so backward is identity.
 template <typename T>
 class ContiguousBackward : public Node<T> {
 public:
+    /**
+     * Construct the backward node for contiguous.
+     * Aliases `x` for the graph edge.
+     *
+     * @param x Forward input (edge only; unused in apply).
+     */
     explicit ContiguousBackward(const Tensor<T>& x) : Node<T>(x) {}
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
+    /**
+     * Identity backward: layout-only op, logical values are unchanged.
+     *
+     * @param propagated_grad Upstream gradient dL/d(contiguous output).
+     * @return `{propagated_grad}` unchanged.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         return {propagated_grad};
     }
 };
 
 template <typename T>
 class BroadcastToBackward : public Node<T> {
-    // We only need the original shape for the backward sum reduction.
-    // The original tensor data is not required, so we do not save it
-    // (same pattern as TransposeBackward / ReshapeBackward).
     std::vector<int64_t> original_shape_;
-public:
-    BroadcastToBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
-        : Node<T>(x), original_shape_(std::move(original_shape))
-    {}
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
-        // broadcast_to "virtually replicated" elements via stride-0 views.
-        // The backward undoes that by summing all gradient contributions
-        // that pointed at the same original element back together.
+public:
+    /**
+     * Construct the backward node for broadcast_to.
+     * Aliases `x` for the graph edge and stores the pre-broadcast shape.
+     *
+     * @param x Forward input (edge only; unused in apply).
+     * @param original_shape Shape of `x` before broadcast.
+     */
+    BroadcastToBackward(const Tensor<T>& x, std::vector<int64_t> original_shape)
+        : Node<T>(x), original_shape_(std::move(original_shape)) {}
+
+    /**
+     * Sum `propagated_grad` back onto `original_shape_` via `sum_to`.
+     *
+     * @param propagated_grad Upstream gradient in the broadcast shape.
+     * @return `{dL/dx}`.
+     *
+     * @throws std::invalid_argument if `original_shape_` has a negative dimension.
+     * @throws std::overflow_error if a numel product overflows.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         return {sum_to(propagated_grad, original_shape_)};
     }
 };
@@ -198,13 +294,27 @@ class NarrowBackward : public Node<T> {
     int64_t dim_;
     int64_t start_;
     std::vector<int64_t> input_shape_;
-public:
-    NarrowBackward(const Tensor<T>& x, int64_t dim, int64_t start)
-        : Node<T>(x), dim_(dim), start_(start), input_shape_(x.shape())
-    {}
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
+public:
+    /**
+     * Construct the backward node for narrow.
+     * Aliases `x` and stores the sliced dim, start index, and input shape.
+     *
+     * @param x Forward input (edge only; unused in apply).
+     * @param dim Axis that was narrowed.
+     * @param start First kept index along `dim`.
+     */
+    NarrowBackward(const Tensor<T>& x, int64_t dim, int64_t start)
+        : Node<T>(x), dim_(dim), start_(start), input_shape_(x.shape()) {}
+
+    /**
+     * Scatter `propagated_grad` into a zero tensor of `input_shape_` at the
+     * narrow window (`dim_`, `start_`).
+     *
+     * @param propagated_grad Upstream gradient dL/d(narrow output).
+     * @return `{dL/dx}`.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         std::vector<T> storage(static_cast<size_t>(
             Tensor<T>::compute_numel(input_shape_)), T{0});
         const auto g = propagated_grad.contiguous();
@@ -219,7 +329,8 @@ public:
             for (int64_t d = 0; d < rank; ++d) {
                 int64_t idx = rem / g_strides[static_cast<size_t>(d)];
                 rem %= g_strides[static_cast<size_t>(d)];
-                if (d == dim_) idx += start_;
+                if (d == dim_)
+                    idx += start_;
                 in_f += idx * in_strides[static_cast<size_t>(d)];
             }
             storage[static_cast<size_t>(in_f)] = gd[static_cast<size_t>(f)];
@@ -233,10 +344,18 @@ class CatBackward : public Node<T> {
     int64_t dim_;
     std::vector<int64_t> sizes_;
     std::vector<std::vector<int64_t>> in_shapes_;
+
 public:
+    /**
+     * Construct the backward node for concatenate.
+     * Aliases every input, records next edges, and stores per-input sizes
+     * along `dim` plus full input shapes.
+     *
+     * @param inputs Forward tensors that were concatenated.
+     * @param dim Axis of concatenation.
+     */
     CatBackward(const std::vector<Tensor<T>>& inputs, int64_t dim)
-        : dim_(dim)
-    {
+        : dim_(dim) {
         this->saved_tensors.reserve(inputs.size());
         this->next_edges.reserve(inputs.size());
         sizes_.reserve(inputs.size());
@@ -249,8 +368,14 @@ public:
         }
     }
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
+    /**
+     * Split `propagated_grad` along `dim_` into chunks of `sizes_[i]`.
+     * Saved tensor values are unused; layout comes from `in_shapes_`.
+     *
+     * @param propagated_grad Upstream gradient dL/d(cat output).
+     * @return Per-input gradients matching `inputs` order.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         const auto g = propagated_grad.contiguous();
         const auto& gd = g.data();
         const auto g_shape = g.shape();
@@ -271,7 +396,8 @@ public:
                 for (int64_t d = 0; d < rank; ++d) {
                     int64_t idx = remaining / in_strides[static_cast<size_t>(d)];
                     remaining %= in_strides[static_cast<size_t>(d)];
-                    if (d == dim_) idx += dim_offset;
+                    if (d == dim_)
+                        idx += dim_offset;
                     g_f += idx * g_strides[static_cast<size_t>(d)];
                 }
                 storage[static_cast<size_t>(f)] = gd[static_cast<size_t>(g_f)];
@@ -284,25 +410,31 @@ public:
     }
 };
 
-// Backward of y = cast_{InT → OutT}(x): recast the incoming gradient to InT.
-// The Jacobian is the identity, so apply() is a dtype conversion of `propagated_grad`.
-//
-// Same-type (`CastBackward<T, T>`): a normal Node<T> edge; the engine continues.
-// Cross-type: Node<OutT> cannot hold Node<InT> edges, so apply() either
-// accumulate_grad()s into a leaf or run_backward()s the InT subgraph.
-
 template <typename OutT, typename InT>
 class CastBackward : public Node<OutT> {
     Tensor<InT> input_;
     std::shared_ptr<Node<InT>> input_fn_;
+
 public:
+    /**
+     * Construct the backward node for a dtype cast `InT` → `OutT`.
+     * Aliases the source tensor and stores its `InT` grad_fn.
+     *
+     * @param x Forward input before the cast.
+     */
     explicit CastBackward(const Tensor<InT>& x)
         : input_(Tensor<InT>::alias(x))
-        , input_fn_(x.grad_fn())
-    {}
+        , input_fn_(x.grad_fn()) {}
 
-    std::vector<Tensor<OutT>> apply(const Tensor<OutT>& propagated_grad) override
-    {
+    /**
+     * Recast `propagated_grad` to `InT` and continue the `InT` graph.
+     * If `input_fn_` is set, calls `run_backward`; else if `input_` requires grad,
+     * accumulates on the leaf. Returns an empty vector (no `OutT` next edges).
+     *
+     * @param propagated_grad Upstream gradient in `OutT`.
+     * @return Empty vector.
+     */
+    std::vector<Tensor<OutT>> apply(const Tensor<OutT>& propagated_grad) override {
         const auto g = propagated_grad.contiguous();
         std::vector<InT> storage(static_cast<size_t>(g.numel()));
         const auto& gd = g.data();
@@ -322,10 +454,21 @@ public:
 template <typename T>
 class CastBackward<T, T> : public Node<T> {
 public:
+    /**
+     * Construct the same-type cast backward node.
+     * Aliases `x` for a normal `Node<T>` edge.
+     *
+     * @param x Forward input (same dtype as the output).
+     */
     explicit CastBackward(const Tensor<T>& x) : Node<T>(x) {}
 
-    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override
-    {
+    /**
+     * Identity Jacobian: return `propagated_grad` unchanged.
+     *
+     * @param propagated_grad Upstream gradient dL/d(cast output).
+     * @return `{propagated_grad}`.
+     */
+    std::vector<Tensor<T>> apply(const Tensor<T>& propagated_grad) override {
         return {propagated_grad};
     }
 };

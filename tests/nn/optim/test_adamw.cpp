@@ -1,3 +1,15 @@
+/*
+ * AdamW: decoupled weight decay vs Adam's coupled λ.
+ *
+ * - λ is applied outside moments
+ * - one step with λ=0; one step with λ>0
+ * - two steps persist moments (t=2 bias correction)
+ * - two steps with decoupled λ
+ * - missing grad does not bump t
+ * - zero_grad clears grads without wiping m/v
+ * - Adam and AdamW match at λ=0 and differ at λ>0
+ */
+
 #include <vector>
 
 #include "../../doctest/doctest.h"

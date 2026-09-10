@@ -16,6 +16,7 @@
 // Layer 3: forward ops (each header includes its own backward nodes)
 #include "../ops/elementwise_ops.h"
 #include "../ops/shape_ops.h"
+#include "../ops/embedding_ops.h"
 
 // Layer 3.5: mixed-dtype overloads (must come after same-type ops are defined)
 #include "../ops/mixed_dtype_ops.h"

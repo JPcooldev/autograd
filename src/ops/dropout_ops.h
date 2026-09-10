@@ -13,15 +13,26 @@
 
 namespace ops {
 
-// Inverted dropout. If `training` is false or p == 0, returns `x` unchanged.
-// `seed` is used only in training mode so tests can be deterministic.
+/**
+ * Apply inverted dropout. If `training` is false or `p` is 0, returns `x`
+ * unchanged; otherwise multiplies packed elements by 0 or `1/(1-p)` and
+ * attaches `DropoutBackward` when grad is enabled. `seed` is used only in
+ * training mode so tests can be deterministic.
+ *
+ * @param x The tensor to drop out.
+ * @param p Drop probability in `[0, 1)`.
+ * @param training Whether dropout is active.
+ * @param seed Optional RNG seed used only when training and `p > 0`.
+ * @return `x` unchanged, or a new tensor of the same shape with dropped values.
+ *
+ * @throws std::invalid_argument if `p` is outside `[0, 1)`.
+ */
 template <typename T>
 tensor::Tensor<T> dropout(
     const tensor::Tensor<T>& x,
     double p,
     bool training,
-    std::optional<uint64_t> seed = std::nullopt)
-{
+    std::optional<uint64_t> seed = std::nullopt) {
     if (p < 0.0 || p >= 1.0)
         throw std::invalid_argument("dropout: p must be in [0, 1)");
     if (!training || p == 0.0)

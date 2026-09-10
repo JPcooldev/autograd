@@ -1,3 +1,16 @@
+/*
+ * Chained operator[] reads, writes, and index errors.
+ *
+ * - 1-D / 2-D / 3-D reads
+ * - const chain is read-only
+ * - 1-D / 2-D assignment, including mutation of the backing buffer
+ * - out-of-range index
+ * - too many indices
+ * - int32_t tensors
+ * - incomplete index on rank-2 (logic_error)
+ * - write through a transpose view
+ */
+
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -102,4 +115,16 @@ TEST_CASE("operator[] works for int32_t tensor") {
     CHECK(static_cast<int32_t>(t[1][1]) == 4);
     t[0][1] = 99;
     CHECK(static_cast<int32_t>(t[0][1]) == 99);
+}
+
+TEST_CASE("operator[] throws on incomplete index of a rank-2 tensor") {
+    tensor::Tensor<float> t({2, 3}, {1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, false);
+    CHECK_THROWS_AS(static_cast<float>(t[0]), std::logic_error);
+}
+
+TEST_CASE("operator[] assignment through a transpose writes the owner") {
+    tensor::Tensor<float> t({2, 3}, {1.f, 2.f, 3.f, 4.f, 5.f, 6.f}, false);
+    auto tr = t.transpose();
+    tr[1][0] = 99.f;
+    CHECK(t.data()[1] == doctest::Approx(99.f));
 }

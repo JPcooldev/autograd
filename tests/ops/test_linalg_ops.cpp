@@ -1,3 +1,18 @@
+/*
+ * Dot and matmul: values, errors, batch broadcast, and backward.
+ *
+ * - dot: scalar result, value, method vs free fn, double
+ * - dot throws on rank ≠ 1 and length mismatch
+ * - dot grad_fn when either side requires grad; DotBackward; next_edges
+ * - matmul output size and (2,3)@(3,2) values; identity; method vs free fn; double
+ * - matmul throws on rank < 2 and inner-dim mismatch
+ * - transposed (non-contiguous) matmul
+ * - MatmulBackward dA = G@Bᵀ, dB = Aᵀ@G; packed saved transposes; next_edges
+ * - 3-D batch; 2-D↔3-D broadcast; size-1 batch; incompatible batch throw
+ * - 3-D with transposed last two dims
+ * - 3-D backward per batch; sum over a broadcast batch dim
+ */
+
 #include <stdexcept>
 #include <vector>
 
@@ -171,14 +186,14 @@ TEST_CASE("matmul works with double") {
         CHECK(C.data()[i] == doctest::Approx(A.data()[i]));
 }
 
-TEST_CASE("matmul throws when first argument is not 2D") {
+TEST_CASE("matmul throws when first argument has rank < 2") {
     const tensor::Tensor<float> A({6},    std::vector<float>(6, 1.f), false);
     const tensor::Tensor<float> B({2, 3}, std::vector<float>(6, 1.f), false);
 
     CHECK_THROWS_AS(ops::matmul(A, B), std::invalid_argument);
 }
 
-TEST_CASE("matmul throws when second argument is not 2D") {
+TEST_CASE("matmul throws when second argument has rank < 2") {
     const tensor::Tensor<float> A({2, 3}, std::vector<float>(6, 1.f), false);
     const tensor::Tensor<float> B({6},    std::vector<float>(6, 1.f), false);
 
@@ -312,4 +327,152 @@ TEST_CASE("matmul wires next_edges to input grad_fn") {
     REQUIRE(C.grad_fn().get() != nullptr);
     REQUIRE(C.grad_fn()->next_edges.size() == 2);
     CHECK(C.grad_fn()->next_edges[0].get() == A.grad_fn().get());
+}
+
+// ─── matmul: batched (last two dims) ──────────────────────────────────────────
+
+TEST_CASE("matmul on 3D tensors multiplies last two dims independently") {
+    // Two copies of (2,3) @ (3,2) stacked on a batch axis.
+    // Each batch: C = [[58,64],[139,154]]
+    const tensor::Tensor<float> A({2, 2, 3}, std::vector<float>{
+        1.f,2.f,3.f, 4.f,5.f,6.f,
+        1.f,2.f,3.f, 4.f,5.f,6.f}, false);
+    const tensor::Tensor<float> B({2, 3, 2}, std::vector<float>{
+        7.f,8.f, 9.f,10.f, 11.f,12.f,
+        7.f,8.f, 9.f,10.f, 11.f,12.f}, false);
+    const auto C = ops::matmul(A, B);
+
+    REQUIRE(C.shape() == std::vector<int64_t>{2, 2, 2});
+    for (int64_t b = 0; b < 2; ++b) {
+        CHECK(C.data()[static_cast<size_t>(b * 4 + 0)] == doctest::Approx(58.f));
+        CHECK(C.data()[static_cast<size_t>(b * 4 + 1)] == doctest::Approx(64.f));
+        CHECK(C.data()[static_cast<size_t>(b * 4 + 2)] == doctest::Approx(139.f));
+        CHECK(C.data()[static_cast<size_t>(b * 4 + 3)] == doctest::Approx(154.f));
+    }
+}
+
+TEST_CASE("matmul broadcasts a 2D right operand across a 3D left batch") {
+    const tensor::Tensor<float> A({2, 2, 3}, std::vector<float>{
+        1.f,2.f,3.f, 4.f,5.f,6.f,
+        1.f,2.f,3.f, 4.f,5.f,6.f}, false);
+    const tensor::Tensor<float> B({3, 2},
+        std::vector<float>{7.f,8.f, 9.f,10.f, 11.f,12.f}, false);
+    const auto C = ops::matmul(A, B);
+
+    REQUIRE(C.shape() == std::vector<int64_t>{2, 2, 2});
+    CHECK(C.data()[0] == doctest::Approx(58.f));
+    CHECK(C.data()[4] == doctest::Approx(58.f));
+}
+
+TEST_CASE("matmul broadcasts a 2D left operand across a 3D right batch") {
+    const tensor::Tensor<float> A({2, 3},
+        std::vector<float>{1.f,2.f,3.f, 4.f,5.f,6.f}, false);
+    const tensor::Tensor<float> B({2, 3, 2}, std::vector<float>{
+        7.f,8.f, 9.f,10.f, 11.f,12.f,
+        7.f,8.f, 9.f,10.f, 11.f,12.f}, false);
+    const auto C = ops::matmul(A, B);
+
+    REQUIRE(C.shape() == std::vector<int64_t>{2, 2, 2});
+    CHECK(C.data()[0] == doctest::Approx(58.f));
+    CHECK(C.data()[4] == doctest::Approx(58.f));
+}
+
+TEST_CASE("matmul broadcasts size-1 batch dim") {
+    // A: (1, 2, 3) broadcasts against B: (2, 3, 2) → (2, 2, 2)
+    const tensor::Tensor<float> A({1, 2, 3},
+        std::vector<float>{1.f,2.f,3.f, 4.f,5.f,6.f}, false);
+    const tensor::Tensor<float> B({2, 3, 2}, std::vector<float>{
+        7.f,8.f, 9.f,10.f, 11.f,12.f,
+        7.f,8.f, 9.f,10.f, 11.f,12.f}, false);
+    const auto C = ops::matmul(A, B);
+
+    REQUIRE(C.shape() == std::vector<int64_t>{2, 2, 2});
+    CHECK(C.data()[0] == doctest::Approx(58.f));
+    CHECK(C.data()[4] == doctest::Approx(58.f));
+}
+
+TEST_CASE("matmul throws on incompatible batch dims") {
+    const tensor::Tensor<float> A({2, 2, 3}, std::vector<float>(12, 1.f), false);
+    const tensor::Tensor<float> B({3, 3, 2}, std::vector<float>(18, 1.f), false);
+
+    CHECK_THROWS_AS(ops::matmul(A, B), std::invalid_argument);
+}
+
+TEST_CASE("matmul with transposed last two dims of a 3D tensor") {
+    // A = [[1,2],[3,4]] with a leading batch of 1; transpose last two → [[1,3],[2,4]]
+    // B = [[5,6],[7,8]]
+    // A^T @ B = [[26,30],[38,44]]
+    const tensor::Tensor<float> A({1, 2, 2},
+        std::vector<float>{1.f, 2.f, 3.f, 4.f}, false);
+    const tensor::Tensor<float> B({2, 2},
+        std::vector<float>{5.f, 6.f, 7.f, 8.f}, false);
+
+    const auto A_t = A.transpose(1, 2);
+    const auto C   = ops::matmul(A_t, B);
+
+    REQUIRE(C.shape() == std::vector<int64_t>{1, 2, 2});
+    CHECK(C.data()[0] == doctest::Approx(26.f));
+    CHECK(C.data()[1] == doctest::Approx(30.f));
+    CHECK(C.data()[2] == doctest::Approx(38.f));
+    CHECK(C.data()[3] == doctest::Approx(44.f));
+}
+
+TEST_CASE("MatmulBackward on 3D tensors is independent per batch") {
+    // Per batch: A = [[1,2],[3,4]], B = [[5,6],[7,8]], grad = I
+    // dA = B^T = [[5,7],[6,8]], dB = A^T = [[1,3],[2,4]]
+    const tensor::Tensor<float> A({2, 2, 2}, std::vector<float>{
+        1.f,2.f, 3.f,4.f,
+        1.f,2.f, 3.f,4.f}, true);
+    const tensor::Tensor<float> B({2, 2, 2}, std::vector<float>{
+        5.f,6.f, 7.f,8.f,
+        5.f,6.f, 7.f,8.f}, true);
+    const auto C = ops::matmul(A, B);
+
+    const tensor::Tensor<float> grad({2, 2, 2}, std::vector<float>{
+        1.f,0.f, 0.f,1.f,
+        1.f,0.f, 0.f,1.f}, false);
+    const auto grads = C.grad_fn()->apply(grad);
+
+    REQUIRE(grads[0].shape() == std::vector<int64_t>{2, 2, 2});
+    REQUIRE(grads[1].shape() == std::vector<int64_t>{2, 2, 2});
+    for (int64_t b = 0; b < 2; ++b) {
+        CHECK(grads[0].data()[static_cast<size_t>(b * 4 + 0)] == doctest::Approx(5.f));
+        CHECK(grads[0].data()[static_cast<size_t>(b * 4 + 1)] == doctest::Approx(7.f));
+        CHECK(grads[0].data()[static_cast<size_t>(b * 4 + 2)] == doctest::Approx(6.f));
+        CHECK(grads[0].data()[static_cast<size_t>(b * 4 + 3)] == doctest::Approx(8.f));
+
+        CHECK(grads[1].data()[static_cast<size_t>(b * 4 + 0)] == doctest::Approx(1.f));
+        CHECK(grads[1].data()[static_cast<size_t>(b * 4 + 1)] == doctest::Approx(3.f));
+        CHECK(grads[1].data()[static_cast<size_t>(b * 4 + 2)] == doctest::Approx(2.f));
+        CHECK(grads[1].data()[static_cast<size_t>(b * 4 + 3)] == doctest::Approx(4.f));
+    }
+}
+
+TEST_CASE("MatmulBackward sums gradients over a broadcast batch dim") {
+    // A (1,2,2) = I broadcasts against B (2,2,2). C[b] = B[b].
+    // grad = all ones. dA = Σ_b ones @ B[b]^T, dB[b] = I @ ones = ones.
+    const tensor::Tensor<float> A({1, 2, 2},
+        std::vector<float>{1.f, 0.f, 0.f, 1.f}, true);
+    const tensor::Tensor<float> B({2, 2, 2}, std::vector<float>{
+        1.f,2.f, 3.f,4.f,
+        5.f,6.f, 7.f,8.f}, true);
+    const auto C = ops::matmul(A, B);
+
+    REQUIRE(C.shape() == std::vector<int64_t>{2, 2, 2});
+
+    const tensor::Tensor<float> grad({2, 2, 2}, std::vector<float>(8, 1.f), false);
+    const auto grads = C.grad_fn()->apply(grad);
+
+    REQUIRE(grads[0].shape() == std::vector<int64_t>{1, 2, 2});
+    REQUIRE(grads[1].shape() == std::vector<int64_t>{2, 2, 2});
+
+    // dA = [[1,1],[1,1]] @ [[1,3],[2,4]] + [[1,1],[1,1]] @ [[5,7],[6,8]]
+    //    = [[3,7],[3,7]] + [[11,15],[11,15]] = [[14,22],[14,22]]
+    CHECK(grads[0].data()[0] == doctest::Approx(14.f));
+    CHECK(grads[0].data()[1] == doctest::Approx(22.f));
+    CHECK(grads[0].data()[2] == doctest::Approx(14.f));
+    CHECK(grads[0].data()[3] == doctest::Approx(22.f));
+
+    for (size_t i = 0; i < 8; ++i)
+        CHECK(grads[1].data()[i] == doctest::Approx(1.f));
 }
