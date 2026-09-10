@@ -5,4 +5,5 @@ build/
 doctest-docs/
 data-example/
 CONCEPT.md
+DESIGN.md
 NOTES.md
